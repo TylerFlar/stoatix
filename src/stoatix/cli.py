@@ -177,6 +177,27 @@ def run(
             help="Include distribution plots in report. Requires matplotlib for images.",
         ),
     ] = False,
+    perf_stat: Annotated[
+        bool,
+        typer.Option(
+            "--perf-stat/--no-perf-stat",
+            help="Collect Linux perf stat counters (Linux only).",
+        ),
+    ] = False,
+    perf_events: Annotated[
+        str,
+        typer.Option(
+            "--perf-events",
+            help="Comma-separated perf events to collect.",
+        ),
+    ] = "cycles,instructions,branches,branch-misses,cache-references,cache-misses,context-switches,cpu-migrations,page-faults",
+    perf_strict: Annotated[
+        bool,
+        typer.Option(
+            "--perf-strict/--no-perf-strict",
+            help="Fail run if perf stat collection fails (otherwise degrades gracefully).",
+        ),
+    ] = False,
 ) -> None:
     """Run benchmarks using the specified configuration."""
     import random
@@ -272,7 +293,15 @@ def run(
         else:
             # Full run
             from stoatix.runner import run_suite
-            run_suite(config_path, out, shuffle=shuffle, seed=seed)
+            run_suite(
+                config_path,
+                out,
+                shuffle=shuffle,
+                seed=seed,
+                perf_stat=perf_stat,
+                perf_events=perf_events,
+                perf_strict=perf_strict,
+            )
 
             # Auto-summarize if enabled and results exist
             results_path = out / "results.jsonl"

@@ -1,7 +1,8 @@
 """Markdown report generator for benchmark results.
 
 This module generates comprehensive Markdown reports from benchmark runs,
-including metadata, statistics tables, and optional text-based visualizations.
+including metadata, statistics tables, perf stat metrics (when available),
+and optional text-based visualizations.
 """
 
 import json
@@ -98,13 +99,16 @@ def generate_report(
     _add_title_section(lines, session_data)
 
     # Quick links
-    _add_quick_links(lines, out_dir, results_path)
+    _add_quick_links(lines, out_dir, results_path, records)
 
     # Run metadata
     _add_metadata_section(lines, session_data)
 
     # Results table
     _add_results_table(lines, summaries)
+
+    # Perf stat section (if data available)
+    _add_perf_stat_section(lines, summaries, records)
 
     # Failures section
     _add_failures_section(lines, summaries)
@@ -120,7 +124,8 @@ def generate_report(
         _add_plots_section(lines, summaries, generated_plots)
 
     # Footer with definitions
-    _add_footer_section(lines, outliers)
+    has_perf = _has_perf_data(summaries)
+    _add_footer_section(lines, outliers, has_perf=has_perf)
 
     # Write report
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -167,7 +172,12 @@ def _add_title_section(lines: list[str], session_data: dict[str, Any] | None) ->
     lines.append("")
 
 
-def _add_quick_links(lines: list[str], out_dir: Path, results_path: Path) -> None:
+def _add_quick_links(
+    lines: list[str],
+    out_dir: Path,
+    results_path: Path,
+    records: list[dict[str, Any]],
+) -> None:
     """Add quick links to artifacts."""
     lines.append("## Artifacts")
     lines.append("")
@@ -183,6 +193,11 @@ def _add_quick_links(lines: list[str], out_dir: Path, results_path: Path) -> Non
     for name, path in artifacts:
         if path.exists():
             lines.append(f"- [{name}]({name})")
+
+    # Add perf_stat directory link if perf data was collected
+    perf_stat_dir = out_dir / "perf_stat"
+    if perf_stat_dir.exists() and any(perf_stat_dir.iterdir()):
+        lines.append("- [perf_stat/](perf_stat/) - Linux perf stat CSV files")
 
     lines.append("")
 
@@ -336,6 +351,94 @@ def _fmt_float(value: float | None, precision: int = 6) -> str:
     if value is None:
         return "-"
     return f"{value:.{precision}f}"
+
+
+def _has_perf_data(summaries: list[dict[str, Any]]) -> bool:
+    """Check if any summary has perf-derived metrics."""
+    for s in summaries:
+        if s.get("median_cpi") is not None:
+            return True
+        if s.get("median_ipc") is not None:
+            return True
+        if s.get("median_cache_miss_rate") is not None:
+            return True
+    return False
+
+
+def _get_perf_events_from_records(records: list[dict[str, Any]]) -> list[str]:
+    """Extract perf events from records if available."""
+    for record in records:
+        metrics = record.get("metrics")
+        if metrics and isinstance(metrics, dict):
+            events = metrics.get("perf_events")
+            if events and isinstance(events, list):
+                return events
+    return []
+
+
+def _add_perf_stat_section(
+    lines: list[str],
+    summaries: list[dict[str, Any]],
+    records: list[dict[str, Any]],
+) -> None:
+    """Add perf stat section with hardware counter metrics.
+
+    Only displayed if perf-derived metrics are available for at least one case.
+    """
+    if not _has_perf_data(summaries):
+        return
+
+    lines.append("## Perf Stat Metrics")
+    lines.append("")
+
+    # Add info about perf stat collection
+    perf_events = _get_perf_events_from_records(records)
+    if perf_events:
+        lines.append(f"**Events collected:** `{', '.join(perf_events)}`")
+        lines.append("")
+
+    lines.append("> **Note:** Linux perf stat metrics require Linux with `perf` installed.")
+    lines.append("> May require `kernel.perf_event_paranoid` sysctl adjustment for non-root users.")
+    lines.append("")
+
+    # Table header
+    headers = [
+        "bench_name",
+        "case_key",
+        "median_cpi",
+        "p95_cpi",
+        "median_ipc",
+        "cache_miss_%",
+    ]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+
+    # Table rows - only include rows with at least some perf data
+    for s in summaries:
+        has_any = (
+            s.get("median_cpi") is not None
+            or s.get("median_ipc") is not None
+            or s.get("median_cache_miss_rate") is not None
+        )
+        if not has_any:
+            continue
+
+        # Format cache miss rate as percentage
+        cache_miss_pct = None
+        if s.get("median_cache_miss_rate") is not None:
+            cache_miss_pct = s["median_cache_miss_rate"] * 100
+
+        row = [
+            s["bench_name"],
+            s["case_key"] or "-",
+            _fmt_float(s.get("median_cpi"), precision=3),
+            _fmt_float(s.get("p95_cpi"), precision=3),
+            _fmt_float(s.get("median_ipc"), precision=3),
+            _fmt_float(cache_miss_pct, precision=2) if cache_miss_pct is not None else "-",
+        ]
+        lines.append("| " + " | ".join(row) + " |")
+
+    lines.append("")
 
 
 def _add_failures_section(lines: list[str], summaries: list[dict[str, Any]]) -> None:
@@ -581,7 +684,7 @@ def _text_histogram(values: list[float], bins: int = 10, width: int = 40) -> str
     return "\n".join(lines)
 
 
-def _add_footer_section(lines: list[str], outliers: str) -> None:
+def _add_footer_section(lines: list[str], outliers: str, has_perf: bool = False) -> None:
     """Add footer with definitions and policies."""
     lines.append("---")
     lines.append("")
@@ -599,4 +702,15 @@ def _add_footer_section(lines: list[str], outliers: str) -> None:
 
     lines.append("- **stdev_s**: Sample standard deviation (ddof=1). Blank if n < 2.")
     lines.append("- **p95_s**: 95th percentile using linear interpolation between adjacent sorted values.")
+
+    if has_perf:
+        lines.append("")
+        lines.append("### Perf Stat Metrics")
+        lines.append("")
+        lines.append("- **CPI** (Cycles Per Instruction): Lower is better. Typical range 0.2–4.0.")
+        lines.append("- **IPC** (Instructions Per Cycle): Higher is better (inverse of CPI).")
+        lines.append("- **cache_miss_%**: Percentage of cache references that missed (cache-misses / cache-references × 100).")
+        lines.append("- Perf stat collection requires Linux with `perf` installed and appropriate permissions.")
+        lines.append("- Raw perf CSV files are stored in the `perf_stat/` directory.")
+
     lines.append("")

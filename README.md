@@ -23,6 +23,9 @@ uv run stoatix run examples/stoatix.yaml --out out/
 
 # Run with shuffle (randomized case order)
 uv run stoatix run examples/stoatix.yaml --shuffle --seed 12345
+
+# Run with Linux perf stat counters (Linux only)
+uv run stoatix run examples/stoatix.yaml --perf-stat
 ```
 
 ## Results
@@ -127,6 +130,9 @@ uv run stoatix run <config.yaml> [OPTIONS]
 #   --summarize          Generate summary.csv after run (default)
 #   --no-summarize       Skip summary generation
 #   --outliers TEXT      Outlier filtering: 'iqr' (default) or 'none'
+#   --perf-stat          Collect Linux perf stat counters (Linux only)
+#   --perf-events TEXT   Comma-separated perf events (has sensible defaults)
+#   --perf-strict        Fail if perf unavailable (default: degrade gracefully)
 
 # Summarize existing results
 uv run stoatix summarize <results.jsonl> [OPTIONS]
@@ -154,6 +160,31 @@ uv run stoatix run config.yaml --outliers none
 uv run stoatix summarize out/results.jsonl --out report.csv
 uv run stoatix compare main/results.jsonl pr/results.jsonl --threshold 0.03
 ```
+
+## Linux perf stat Integration
+
+On Linux, Stoatix can collect hardware performance counters via `perf stat`:
+
+```bash
+# Enable perf stat collection
+uv run stoatix run config.yaml --perf-stat
+
+# Custom events (default includes cycles, instructions, cache misses, etc.)
+uv run stoatix run config.yaml --perf-stat --perf-events "cycles,instructions,LLC-loads,LLC-load-misses"
+
+# Strict mode: fail if perf is unavailable
+uv run stoatix run config.yaml --perf-stat --perf-strict
+```
+
+**Requirements:**
+- Linux with `perf` installed (`linux-tools-generic` on Ubuntu/Debian)
+- Appropriate permissions (may need `sudo` or `kernel.perf_event_paranoid` sysctl)
+
+**Behavior:**
+- `--perf-stat`: Wraps each command with `perf stat -e <events> -x, --`
+- Counters are stored in `perf_counters` field of each result record
+- Without `--perf-strict`: gracefully degrades to timing-only if perf unavailable
+- With `--perf-strict`: exits with error if perf cannot collect data
 
 ## Comparing Results
 

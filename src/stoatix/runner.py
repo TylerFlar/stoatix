@@ -29,6 +29,9 @@ MAX_OUTPUT_CHARS = 4096
 TRUNC_HEAD_CHARS = 2048
 TRUNC_TAIL_CHARS = 2048
 
+# Track if perf warning has been emitted (once per run)
+_perf_warning_emitted = False
+
 
 def run_suite(
     config_path: str | Path,
@@ -36,6 +39,9 @@ def run_suite(
     *,
     shuffle: bool = False,
     seed: int | None = None,
+    perf_stat: bool = False,
+    perf_events: str = "cycles,instructions,branches,branch-misses,cache-references,cache-misses,context-switches,cpu-migrations,page-faults",
+    perf_strict: bool = False,
 ) -> None:
     """Run the benchmark suite based on the provided configuration.
 
@@ -45,6 +51,9 @@ def run_suite(
         shuffle: Whether to shuffle case execution order.
         seed: Random seed for shuffling. If shuffle=True and seed=None,
               a random seed will be generated.
+        perf_stat: Whether to collect Linux perf stat counters.
+        perf_events: Comma-separated list of perf events to collect.
+        perf_strict: If True, fail the run if perf stat cannot be collected.
     """
     config_path = Path(config_path)
     out_path = Path(out_dir)
@@ -96,8 +105,54 @@ def run_suite(
     # Write cases manifest (in execution order after potential shuffle)
     write_cases(out_path, cases, suite_id=suite_id)
 
+    # Check perf availability if requested
+    perf_available = False
+    perf_error_reason: str | None = None
+
+    if perf_stat:
+        from stoatix.perfstat import find_perf, is_supported
+
+        if not is_supported():
+            perf_error_reason = "perf stat is only supported on Linux"
+        elif find_perf() is None:
+            perf_error_reason = "perf executable not found on PATH"
+        else:
+            # Quick check that perf can actually collect stats
+            perf_available = _check_perf_available()
+            if not perf_available:
+                perf_error_reason = (
+                    "perf stat check failed (insufficient permissions or kernel config)"
+                )
+
+        if not perf_available:
+            if perf_strict:
+                raise RuntimeError(
+                    f"perf stat requested with --perf-strict but: {perf_error_reason}. "
+                    "Ensure 'perf' is installed and you have permissions to use it."
+                )
+            else:
+                logger.warning(
+                    "perf stat requested but: %s. Continuing with timing-only measurements.",
+                    perf_error_reason,
+                )
+
+    # Parse perf events list
+    perf_events_list = [e.strip() for e in perf_events.split(",") if e.strip()]
+
+    # Reset per-run warning flag
+    global _perf_warning_emitted
+    _perf_warning_emitted = False
+
     # Run cases
-    _run_cases(cases, suite_id, out_path)
+    _run_cases(
+        cases,
+        suite_id,
+        out_path,
+        perf_stat=perf_stat,
+        perf_available=perf_available,
+        perf_events_list=perf_events_list,
+        perf_error_reason=perf_error_reason,
+    )
 
     logger.info("Results saved to: %s", out_path)
 
@@ -138,19 +193,73 @@ def _truncate_output(text: str) -> str:
     return f"{head}\n... [{omitted} chars omitted] ...\n{tail}"
 
 
-def _run_cases(cases: list[CaseSpec], suite_id: str, out_dir: Path) -> None:
+def _check_perf_available() -> bool:
+    """Check if perf stat is available on the system.
+
+    Returns:
+        True if perf is available and can collect stats, False otherwise.
+    """
+    import sys
+
+    if sys.platform != "linux":
+        logger.debug("perf stat is only available on Linux")
+        return False
+
+    try:
+        result = subprocess.run(
+            ["perf", "stat", "-e", "cycles", "--", "true"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        # perf stat outputs to stderr, check if we got any output
+        if result.returncode == 0 or "cycles" in result.stderr.lower():
+            logger.debug("perf stat is available")
+            return True
+        logger.debug("perf stat not available: %s", result.stderr)
+        return False
+    except FileNotFoundError:
+        logger.debug("perf command not found")
+        return False
+    except subprocess.TimeoutExpired:
+        logger.debug("perf stat check timed out")
+        return False
+    except Exception as e:
+        logger.debug("perf stat check failed: %s", e)
+        return False
+
+
+def _run_cases(
+    cases: list[CaseSpec],
+    suite_id: str,
+    out_dir: Path,
+    *,
+    perf_stat: bool = False,
+    perf_available: bool = False,
+    perf_events_list: list[str] | None = None,
+    perf_error_reason: str | None = None,
+) -> None:
     """Run all expanded cases.
 
     Args:
         cases: List of CaseSpec objects to run.
         suite_id: Unique identifier for this suite run.
         out_dir: Output directory for results.
+        perf_stat: Whether perf stat collection was requested.
+        perf_available: Whether perf stat is actually available.
+        perf_events_list: List of perf events to collect.
+        perf_error_reason: Reason why perf is unavailable (if applicable).
     """
     results_file = out_dir / "results.jsonl"
+    perf_stat_dir = out_dir / "perf_stat"
 
     if not cases:
         logger.warning("No cases to run.")
         return
+
+    # Create perf_stat directory if we'll be collecting perf data
+    if perf_stat and perf_available:
+        perf_stat_dir.mkdir(parents=True, exist_ok=True)
 
     for case in cases:
         case_label = f"{case.bench_name}"
@@ -176,6 +285,11 @@ def _run_cases(cases: list[CaseSpec], suite_id: str, out_dir: Path) -> None:
                 case=case,
                 run_kind="warmup",
                 iteration=i,
+                out_dir=out_dir,
+                perf_stat=perf_stat,
+                perf_available=perf_available,
+                perf_events_list=perf_events_list or [],
+                perf_error_reason=perf_error_reason,
             )
             write_jsonl(results_file, records)
 
@@ -187,6 +301,11 @@ def _run_cases(cases: list[CaseSpec], suite_id: str, out_dir: Path) -> None:
                 case=case,
                 run_kind="measured",
                 iteration=i,
+                out_dir=out_dir,
+                perf_stat=perf_stat,
+                perf_available=perf_available,
+                perf_events_list=perf_events_list or [],
+                perf_error_reason=perf_error_reason,
             )
             write_jsonl(results_file, records)
 
@@ -198,6 +317,12 @@ def _execute_run_with_retries(
     case: CaseSpec,
     run_kind: Literal["warmup", "measured"],
     iteration: int,
+    *,
+    out_dir: Path,
+    perf_stat: bool = False,
+    perf_available: bool = False,
+    perf_events_list: list[str] | None = None,
+    perf_error_reason: str | None = None,
 ) -> list[dict[str, Any]]:
     """Execute a single benchmark run with retry support.
 
@@ -209,6 +334,11 @@ def _execute_run_with_retries(
         case: CaseSpec to execute.
         run_kind: Type of run - "warmup" or "measured".
         iteration: Iteration number (0-indexed).
+        out_dir: Output directory for results.
+        perf_stat: Whether perf stat collection was requested.
+        perf_available: Whether perf stat is actually available.
+        perf_events_list: List of perf events to collect.
+        perf_error_reason: Reason why perf is unavailable (if applicable).
 
     Returns:
         List of run record dictionaries (one per attempt).
@@ -223,6 +353,11 @@ def _execute_run_with_retries(
             run_kind=run_kind,
             iteration=iteration,
             attempt=attempt,
+            out_dir=out_dir,
+            perf_stat=perf_stat,
+            perf_available=perf_available,
+            perf_events_list=perf_events_list or [],
+            perf_error_reason=perf_error_reason,
         )
         records.append(record)
 
@@ -249,6 +384,12 @@ def _execute_single_attempt(
     run_kind: Literal["warmup", "measured"],
     iteration: int,
     attempt: int,
+    *,
+    out_dir: Path,
+    perf_stat: bool = False,
+    perf_available: bool = False,
+    perf_events_list: list[str] | None = None,
+    perf_error_reason: str | None = None,
 ) -> dict[str, Any]:
     """Execute a single attempt of a benchmark run.
 
@@ -258,16 +399,35 @@ def _execute_single_attempt(
         run_kind: Type of run - "warmup" or "measured".
         iteration: Iteration number (0-indexed).
         attempt: Attempt number (1-based).
+        out_dir: Output directory for results.
+        perf_stat: Whether perf stat collection was requested.
+        perf_available: Whether perf stat is actually available.
+        perf_events_list: List of perf events to collect.
+        perf_error_reason: Reason why perf is unavailable (if applicable).
 
     Returns:
         Run record dictionary.
     """
+    global _perf_warning_emitted
+
     elapsed_s: float = 0.0
     exit_code: int | None = None
     ok: bool = False
     timed_out: bool = False
     stdout_text: str = ""
     stderr_text: str = ""
+
+    # Initialize metrics dict (always present when perf_stat requested)
+    metrics: dict[str, Any] | None = None
+    if perf_stat:
+        metrics = {
+            "perf_stat": {},
+            "derived": {"cpi": None, "ipc": None, "cache_miss_rate": None},
+            "perf_stat_path": None,
+            "perf_ok": False,
+            "perf_error": perf_error_reason,
+            "perf_events": perf_events_list or [],
+        }
 
     # Prepare environment (inherit current env + case-specific overrides)
     env = os.environ.copy()
@@ -278,58 +438,156 @@ def _execute_single_attempt(
 
     started_at = datetime.now(timezone.utc)
 
-    try:
-        start = time.perf_counter()
-        result = subprocess.run(
-            case.command,
-            capture_output=True,
-            text=True,
-            timeout=case.timeout_s,
-            cwd=cwd,
-            env=env,
-        )
-        elapsed_s = time.perf_counter() - start
-        exit_code = result.returncode
-        ok = exit_code == 0
-        stdout_text = result.stdout or ""
-        stderr_text = result.stderr or ""
+    # Determine if we should use perf stat for this attempt
+    use_perf = perf_stat and perf_available and perf_events_list
 
-        if not ok:
+    if use_perf:
+        # Use perfstat module
+        from stoatix.perfstat import compute_derived, run_with_perf_stat
+
+        # Create unique output path for this attempt
+        perf_out_file = (
+            out_dir
+            / "perf_stat"
+            / case.case_id
+            / f"{run_kind}_iter{iteration}_attempt{attempt}.csv"
+        )
+        perf_out_file.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            start = time.perf_counter()
+            result, perf_metrics = run_with_perf_stat(
+                cmd=case.command,
+                cwd=cwd,
+                env=env,
+                timeout_s=case.timeout_s,
+                events=perf_events_list,
+                out_file=perf_out_file,
+            )
+            elapsed_s = time.perf_counter() - start
+
+            exit_code = result.returncode
+            ok = exit_code == 0
+            stdout_text = result.stdout or ""
+            stderr_text = result.stderr or ""
+
+            # Update metrics from perfstat module
+            if metrics is not None:
+                # Compute relative path for portability
+                rel_perf_path = perf_out_file.relative_to(out_dir)
+                metrics["perf_stat"] = perf_metrics.get("perf_stat", {})
+                metrics["perf_stat_path"] = str(rel_perf_path)
+                metrics["perf_ok"] = perf_metrics.get("perf_ok", False)
+                metrics["perf_error"] = perf_metrics.get("perf_error")
+                metrics["perf_events"] = perf_metrics.get("perf_events", [])
+
+                # Compute derived metrics
+                if metrics["perf_ok"] and metrics["perf_stat"]:
+                    metrics["derived"] = compute_derived(metrics["perf_stat"])
+
+            if not ok:
+                logger.warning(
+                    "    %s iteration %d attempt %d failed with exit code %d",
+                    run_kind,
+                    iteration,
+                    attempt,
+                    exit_code,
+                )
+
+        except subprocess.TimeoutExpired as e:
+            elapsed_s = case.timeout_s or 0.0
+            exit_code = None
+            ok = False
+            timed_out = True
+            stdout_text = e.stdout or "" if hasattr(e, "stdout") and e.stdout else ""
+            stderr_text = e.stderr or "" if hasattr(e, "stderr") and e.stderr else ""
+            if metrics is not None:
+                metrics["perf_error"] = f"Command timed out after {case.timeout_s}s"
             logger.warning(
-                "    %s iteration %d attempt %d failed with exit code %d",
+                "    %s iteration %d attempt %d timed out after %ss",
                 run_kind,
                 iteration,
                 attempt,
-                exit_code,
+                case.timeout_s,
             )
 
-    except subprocess.TimeoutExpired as e:
-        elapsed_s = case.timeout_s or 0.0
-        exit_code = None
-        ok = False
-        timed_out = True
-        # Capture partial output if available
-        stdout_text = e.stdout or "" if hasattr(e, "stdout") and e.stdout else ""
-        stderr_text = e.stderr or "" if hasattr(e, "stderr") and e.stderr else ""
-        logger.warning(
-            "    %s iteration %d attempt %d timed out after %ss",
-            run_kind,
-            iteration,
-            attempt,
-            case.timeout_s,
-        )
+        except FileNotFoundError:
+            exit_code = None
+            ok = False
+            stderr_text = f"Command not found: {case.command[0]}"
+            if metrics is not None:
+                metrics["perf_error"] = f"Command not found: {case.command[0]}"
+            logger.error("    Command not found: %s", case.command[0])
 
-    except FileNotFoundError:
-        exit_code = None
-        ok = False
-        stderr_text = f"Command not found: {case.command[0]}"
-        logger.error("    Command not found: %s", case.command[0])
+        except OSError as e:
+            exit_code = None
+            ok = False
+            stderr_text = str(e)
+            if metrics is not None:
+                metrics["perf_error"] = f"OS error: {e}"
+            logger.error("    OS error: %s", e)
 
-    except OSError as e:
-        exit_code = None
-        ok = False
-        stderr_text = str(e)
-        logger.error("    OS error: %s", e)
+    else:
+        # Run without perf stat
+        if perf_stat and not perf_available and not _perf_warning_emitted:
+            # Emit warning once per run
+            logger.warning(
+                "perf stat unavailable (%s), running without hardware counters",
+                perf_error_reason or "unknown reason",
+            )
+            _perf_warning_emitted = True
+
+        try:
+            start = time.perf_counter()
+            result = subprocess.run(
+                case.command,
+                capture_output=True,
+                text=True,
+                timeout=case.timeout_s,
+                cwd=cwd,
+                env=env,
+            )
+            elapsed_s = time.perf_counter() - start
+            exit_code = result.returncode
+            ok = exit_code == 0
+            stdout_text = result.stdout or ""
+            stderr_text = result.stderr or ""
+
+            if not ok:
+                logger.warning(
+                    "    %s iteration %d attempt %d failed with exit code %d",
+                    run_kind,
+                    iteration,
+                    attempt,
+                    exit_code,
+                )
+
+        except subprocess.TimeoutExpired as e:
+            elapsed_s = case.timeout_s or 0.0
+            exit_code = None
+            ok = False
+            timed_out = True
+            stdout_text = e.stdout or "" if hasattr(e, "stdout") and e.stdout else ""
+            stderr_text = e.stderr or "" if hasattr(e, "stderr") and e.stderr else ""
+            logger.warning(
+                "    %s iteration %d attempt %d timed out after %ss",
+                run_kind,
+                iteration,
+                attempt,
+                case.timeout_s,
+            )
+
+        except FileNotFoundError:
+            exit_code = None
+            ok = False
+            stderr_text = f"Command not found: {case.command[0]}"
+            logger.error("    Command not found: %s", case.command[0])
+
+        except OSError as e:
+            exit_code = None
+            ok = False
+            stderr_text = str(e)
+            logger.error("    OS error: %s", e)
 
     ended_at = datetime.now(timezone.utc)
 
@@ -357,5 +615,9 @@ def _execute_single_attempt(
         "stdout_trunc": _truncate_output(stdout_text),
         "stderr_trunc": _truncate_output(stderr_text),
     }
+
+    # Add metrics if perf_stat was requested (even if unavailable)
+    if metrics is not None:
+        record["metrics"] = metrics
 
     return record
