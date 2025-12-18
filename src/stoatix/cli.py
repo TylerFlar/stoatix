@@ -156,6 +156,27 @@ def run(
             help="Outlier filtering for summary: 'none' or 'iqr'.",
         ),
     ] = "iqr",
+    do_report: Annotated[
+        bool,
+        typer.Option(
+            "--report/--no-report",
+            help="Generate report after run completes.",
+        ),
+    ] = True,
+    report_format: Annotated[
+        str,
+        typer.Option(
+            "--report-format",
+            help="Report format: 'md' or 'html'.",
+        ),
+    ] = "md",
+    plots: Annotated[
+        bool,
+        typer.Option(
+            "--plots/--no-plots",
+            help="Include distribution plots in report. Requires matplotlib for images.",
+        ),
+    ] = False,
 ) -> None:
     """Run benchmarks using the specified configuration."""
     import random
@@ -175,6 +196,14 @@ def run(
     if outliers not in ("none", "iqr"):
         typer.echo(
             f"Error: Invalid --outliers value '{outliers}'. Must be 'none' or 'iqr'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate report format option early
+    if report_format not in ("md", "html"):
+        typer.echo(
+            f"Error: Invalid --report-format value '{report_format}'. Must be 'md' or 'html'.",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -266,6 +295,49 @@ def run(
                 typer.echo(f"Summary: {n_cases} case(s), {total_ok} OK, {total_failed} failed")
                 typer.echo(f"  Written to: {summary_path}")
 
+            # Auto-generate report if enabled and results exist
+            if do_report and results_path.exists():
+                from stoatix.report import generate_report, _HAS_MATPLOTLIB
+
+                # Determine report output path based on format
+                if report_format == "md":
+                    report_out = out / "report.md"
+                else:
+                    report_out = out / "report.html"
+
+                # Generate markdown report first
+                md_report_path = generate_report(
+                    results_path,
+                    out_path=report_out if report_format == "md" else None,
+                    outliers=outliers,  # type: ignore[arg-type]
+                    plots=plots,
+                )
+
+                if report_format == "html":
+                    # Convert to HTML
+                    md_content = md_report_path.read_text(encoding="utf-8")
+                    html_content = _markdown_to_html(md_content)
+                    report_out.parent.mkdir(parents=True, exist_ok=True)
+                    report_out.write_text(html_content, encoding="utf-8")
+                    # Remove temporary md file if we generated it
+                    if md_report_path != report_out:
+                        md_report_path.unlink(missing_ok=True)
+                    report_path = report_out
+                else:
+                    report_path = md_report_path
+
+                typer.echo(f"Report: {report_path}")
+
+                # Show plots info
+                if plots:
+                    if _HAS_MATPLOTLIB:
+                        plots_dir = report_path.parent / "plots"
+                        if plots_dir.exists():
+                            num_plots = len(list(plots_dir.glob("*.png")))
+                            typer.echo(f"  Boxplot images: {num_plots} in {plots_dir}")
+                    else:
+                        typer.echo("  Note: matplotlib not installed; only text histograms.")
+
     except FileNotFoundError as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(code=1)
@@ -352,6 +424,293 @@ def summarize(
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(code=1)
+
+
+@app.command()
+def report(
+    results_jsonl: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to results.jsonl file from a benchmark run.",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            "-f",
+            help="Output format: 'md' (Markdown) or 'html'.",
+        ),
+    ] = "md",
+    out: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--out",
+            "-o",
+            help="Output file path. Defaults to 'report.md' or 'report.html' next to results.",
+        ),
+    ] = None,
+    outliers: Annotated[
+        str,
+        typer.Option(
+            "--outliers",
+            help="Outlier filtering method: 'none' (keep all) or 'iqr' (IQR-based filtering).",
+        ),
+    ] = "iqr",
+    plots: Annotated[
+        bool,
+        typer.Option(
+            "--plots/--no-plots",
+            help="Include distribution plots. Requires matplotlib for boxplot images.",
+        ),
+    ] = False,
+) -> None:
+    """Generate a report from benchmark results."""
+    from stoatix.report import generate_report
+
+    # Validate format option
+    if format not in ("md", "html"):
+        typer.echo(
+            f"Error: Invalid --format value '{format}'. Must be 'md' or 'html'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate outliers option
+    if outliers not in ("none", "iqr"):
+        typer.echo(
+            f"Error: Invalid --outliers value '{outliers}'. Must be 'none' or 'iqr'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Determine default output path based on format
+    if out is None:
+        if format == "md":
+            out = results_jsonl.parent / "report.md"
+        else:
+            out = results_jsonl.parent / "report.html"
+
+    try:
+        # Generate markdown report first
+        md_report_path = generate_report(
+            results_jsonl,
+            out_path=out if format == "md" else None,
+            outliers=outliers,  # type: ignore[arg-type]
+            plots=plots,
+        )
+
+        if format == "html":
+            # Read markdown content and convert to HTML
+            md_content = md_report_path.read_text(encoding="utf-8")
+            html_content = _markdown_to_html(md_content)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(html_content, encoding="utf-8")
+            # Remove temporary md file if we generated it
+            if md_report_path != out:
+                md_report_path.unlink(missing_ok=True)
+            report_path = out
+        else:
+            report_path = md_report_path
+
+        typer.echo(f"Report written to: {report_path}")
+
+        # Show notice about plots
+        from stoatix.report import _HAS_MATPLOTLIB
+        if plots:
+            if _HAS_MATPLOTLIB:
+                plots_dir = report_path.parent / "plots"
+                if plots_dir.exists():
+                    num_plots = len(list(plots_dir.glob("*.png")))
+                    typer.echo(f"  Boxplot images: {num_plots} in {plots_dir}")
+            else:
+                typer.echo("  Note: matplotlib not installed; only text histograms included.")
+                typer.echo("  Install with: uv add stoatix[viz]")
+
+    except FileNotFoundError:
+        typer.echo(
+            f"Error: Results file not found: {results_jsonl}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+
+
+def _markdown_to_html(md_content: str) -> str:
+    """Convert markdown content to a simple standalone HTML document.
+
+    Uses basic regex-based conversion for tables and formatting.
+    No external dependencies required.
+    """
+    import html
+    import re
+
+    lines = md_content.split("\n")
+    html_lines: list[str] = []
+
+    # HTML header with minimal styling
+    html_lines.append("""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stoatix Report</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            line-height: 1.6;
+            color: #333;
+        }
+        h1, h2, h3 { color: #2c3e50; margin-top: 1.5em; }
+        h1 { border-bottom: 2px solid #3498db; padding-bottom: 10px; }
+        h2 { border-bottom: 1px solid #bdc3c7; padding-bottom: 5px; }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 1em 0;
+            font-size: 0.9em;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px 12px;
+            text-align: left;
+        }
+        th { background-color: #3498db; color: white; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        tr:hover { background-color: #f5f5f5; }
+        code {
+            background-color: #f4f4f4;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Consolas', 'Monaco', monospace;
+        }
+        pre {
+            background-color: #f4f4f4;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 0.85em;
+        }
+        a { color: #3498db; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        ul { padding-left: 20px; }
+        img { max-width: 100%; height: auto; margin: 1em 0; }
+        em { font-style: italic; color: #7f8c8d; }
+        hr { border: none; border-top: 1px solid #eee; margin: 2em 0; }
+    </style>
+</head>
+<body>
+""")
+
+    in_table = False
+    in_code_block = False
+    table_rows: list[str] = []
+
+    def flush_table() -> None:
+        nonlocal in_table, table_rows
+        if table_rows:
+            html_lines.append("<table>")
+            for i, row in enumerate(table_rows):
+                cells = [c.strip() for c in row.strip("|").split("|")]
+                tag = "th" if i == 0 else "td"
+                html_lines.append(f"  <tr>{''.join(f'<{tag}>{html.escape(c)}</{tag}>' for c in cells)}</tr>")
+            html_lines.append("</table>")
+            table_rows = []
+        in_table = False
+
+    for line in lines:
+        # Code block
+        if line.startswith("```"):
+            if in_code_block:
+                html_lines.append("</pre>")
+                in_code_block = False
+            else:
+                flush_table()
+                html_lines.append("<pre>")
+                in_code_block = True
+            continue
+
+        if in_code_block:
+            html_lines.append(html.escape(line))
+            continue
+
+        # Table row
+        if "|" in line and not line.startswith("```"):
+            # Skip separator rows
+            if re.match(r"^\s*\|[\s\-:|]+\|\s*$", line):
+                continue
+            if not in_table:
+                flush_table()
+                in_table = True
+            table_rows.append(line)
+            continue
+        else:
+            flush_table()
+
+        # Headers
+        if line.startswith("# "):
+            html_lines.append(f"<h1>{html.escape(line[2:])}</h1>")
+        elif line.startswith("## "):
+            html_lines.append(f"<h2>{html.escape(line[3:])}</h2>")
+        elif line.startswith("### "):
+            html_lines.append(f"<h3>{html.escape(line[4:])}</h3>")
+        # Horizontal rule
+        elif line.startswith("---"):
+            html_lines.append("<hr>")
+        # List items
+        elif line.startswith("- "):
+            # Convert markdown links in list items
+            content = line[2:]
+            content = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', content)
+            html_lines.append(f"<ul><li>{content}</li></ul>")
+        # Image
+        elif re.match(r"^!\[([^\]]*)\]\(([^)]+)\)", line):
+            match = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)", line)
+            if match:
+                alt, src = match.groups()
+                html_lines.append(f'<img src="{html.escape(src)}" alt="{html.escape(alt)}">')
+        # Bold text line
+        elif line.startswith("**") and ":**" in line:
+            # Key-value style like **Git:** value
+            content = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", line)
+            content = re.sub(r"`([^`]+)`", r"<code>\1</code>", content)
+            html_lines.append(f"<p>{content}</p>")
+        # Italic/emphasis
+        elif line.startswith("*") and line.endswith("*") and not line.startswith("**"):
+            html_lines.append(f"<p><em>{html.escape(line.strip('*'))}</em></p>")
+        # Empty line
+        elif not line.strip():
+            html_lines.append("")
+        # Regular paragraph
+        else:
+            content = html.escape(line)
+            # Convert inline code
+            content = re.sub(r"`([^`]+)`", r"<code>\1</code>", content)
+            # Convert links
+            content = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2">\1</a>', content)
+            # Convert bold
+            content = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", content)
+            if content.strip():
+                html_lines.append(f"<p>{content}</p>")
+
+    flush_table()
+
+    html_lines.append("""
+</body>
+</html>""")
+
+    return "\n".join(html_lines)
 
 
 if __name__ == "__main__":

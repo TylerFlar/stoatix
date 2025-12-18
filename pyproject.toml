@@ -15,6 +15,11 @@ dependencies = [
 [project.scripts]
 stoatix = "stoatix.cli:app"
 
+[project.optional-dependencies]
+viz = [
+    "matplotlib>=3.10.8",
+]
+
 [build-system]
 requires = ["uv_build>=0.9.7,<0.10.0"]
 build-backend = "uv_build"
