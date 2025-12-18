@@ -21,6 +21,7 @@ class DefaultsConfig:
 
     warmups: int = 1
     runs: int = 5
+    retries: int = 0
     timeout_s: float | None = None
     cwd: str | None = None
     env: dict[str, str] = field(default_factory=dict)
@@ -35,6 +36,7 @@ class BenchmarkConfig:
     command: list[str]
     warmups: int = 1
     runs: int = 5
+    retries: int = 0
     timeout_s: float | None = None
     cwd: str | None = None
     env: dict[str, str] = field(default_factory=dict)
@@ -48,6 +50,54 @@ class SuiteConfig:
 
     defaults: DefaultsConfig = field(default_factory=DefaultsConfig)
     benchmarks: list[BenchmarkConfig] = field(default_factory=list)
+
+    def to_resolved_dict(self) -> dict[str, Any]:
+        """Produce a resolved config dict with all defaults explicit.
+
+        Returns:
+            Dictionary suitable for writing to YAML, with:
+            - defaults section fully filled with explicit values
+            - each benchmark showing inherited + overridden values
+        """
+        # Build defaults dict with all explicit values
+        defaults_dict: dict[str, Any] = {
+            "warmups": self.defaults.warmups,
+            "runs": self.defaults.runs,
+            "retries": self.defaults.retries,
+            "timeout_s": self.defaults.timeout_s,
+            "cwd": self.defaults.cwd,
+            "env": dict(self.defaults.env) if self.defaults.env else {},
+            "pin": {
+                "strategy": self.defaults.pin.strategy,
+                "cores": list(self.defaults.pin.cores) if self.defaults.pin.cores else [],
+            },
+        }
+
+        # Build benchmarks list with resolved values
+        benchmarks_list: list[dict[str, Any]] = []
+        for bench in self.benchmarks:
+            bench_dict: dict[str, Any] = {
+                "name": bench.name,
+                "command": list(bench.command),
+                "warmups": bench.warmups,
+                "runs": bench.runs,
+                "retries": bench.retries,
+                "timeout_s": bench.timeout_s,
+                "cwd": bench.cwd,
+                "env": dict(bench.env) if bench.env else {},
+                "pin": {
+                    "strategy": bench.pin.strategy,
+                    "cores": list(bench.pin.cores) if bench.pin.cores else [],
+                },
+            }
+            if bench.matrix:
+                bench_dict["matrix"] = {k: list(v) for k, v in bench.matrix.items()}
+            benchmarks_list.append(bench_dict)
+
+        return {
+            "defaults": defaults_dict,
+            "benchmarks": benchmarks_list,
+        }
 
 
 def load_config(path: str | Path) -> SuiteConfig:
@@ -143,7 +193,7 @@ def _parse_defaults(raw: Any) -> DefaultsConfig:
         raise ValueError("'defaults' must be a mapping.")
 
     # Validate defaults keys
-    allowed_defaults = {"warmups", "runs", "timeout_s", "cwd", "env", "pin"}
+    allowed_defaults = {"warmups", "runs", "retries", "timeout_s", "cwd", "env", "pin"}
     for key in raw:
         if key not in allowed_defaults:
             raise ValueError(
@@ -152,6 +202,7 @@ def _parse_defaults(raw: Any) -> DefaultsConfig:
 
     warmups = _parse_int_field(raw, "warmups", "defaults", default=1, min_val=0)
     runs = _parse_int_field(raw, "runs", "defaults", default=5, min_val=0)
+    retries = _parse_int_field(raw, "retries", "defaults", default=0, min_val=0)
     timeout_s = _parse_timeout(raw, "defaults")
     cwd = _parse_optional_str(raw, "cwd", "defaults")
     env = _parse_env(raw, "defaults")
@@ -160,6 +211,7 @@ def _parse_defaults(raw: Any) -> DefaultsConfig:
     return DefaultsConfig(
         warmups=warmups,
         runs=runs,
+        retries=retries,
         timeout_s=timeout_s,
         cwd=cwd,
         env=env,
@@ -242,7 +294,7 @@ def _parse_benchmark(
 
     # Validate benchmark keys
     allowed_benchmark = {
-        "name", "command", "warmups", "runs", "timeout_s", "cwd", "env", "pin", "matrix"
+        "name", "command", "warmups", "runs", "retries", "timeout_s", "cwd", "env", "pin", "matrix"
     }
     for key in item:
         if key not in allowed_benchmark:
@@ -277,6 +329,9 @@ def _parse_benchmark(
         item, "warmups", context, default=defaults.warmups, min_val=0
     )
     runs = _parse_int_field(item, "runs", context, default=defaults.runs, min_val=0)
+    retries = _parse_int_field(
+        item, "retries", context, default=defaults.retries, min_val=0
+    )
     timeout_s = _parse_timeout(item, context, default=defaults.timeout_s)
     cwd = _parse_optional_str(item, "cwd", context, default=defaults.cwd)
 
@@ -298,6 +353,7 @@ def _parse_benchmark(
         command=command,
         warmups=warmups,
         runs=runs,
+        retries=retries,
         timeout_s=timeout_s,
         cwd=cwd,
         env=env,

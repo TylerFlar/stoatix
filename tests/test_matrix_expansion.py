@@ -1,4 +1,4 @@
-"""Tests for matrix expansion and templating (Milestone 1)."""
+"""Tests for matrix expansion and templating"""
 
 import pytest
 

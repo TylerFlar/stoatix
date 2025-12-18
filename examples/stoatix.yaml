@@ -1,6 +1,5 @@
 # Stoatix Configuration Example
 # ==============================
-# Demonstrates Milestone 1 features: defaults, matrix expansion, templating
 
 # Defaults applied to all benchmarks
 defaults:

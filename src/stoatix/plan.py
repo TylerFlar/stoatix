@@ -25,6 +25,7 @@ class CaseSpec:
     env: dict[str, str]
     warmups: int
     runs: int
+    retries: int
     timeout_s: float | None
     pin: PinConfig
     case_key: str
@@ -179,6 +180,7 @@ def expand_benchmark_cases(bench: BenchmarkConfig) -> list[CaseSpec]:
                 env=_render_env(bench.env, params),
                 warmups=bench.warmups,
                 runs=bench.runs,
+                retries=bench.retries,
                 timeout_s=bench.timeout_s,
                 pin=bench.pin,
                 case_key=case_key,
@@ -208,6 +210,7 @@ def expand_benchmark_cases(bench: BenchmarkConfig) -> list[CaseSpec]:
                 env=_render_env(bench.env, params),
                 warmups=bench.warmups,
                 runs=bench.runs,
+                retries=bench.retries,
                 timeout_s=bench.timeout_s,
                 pin=bench.pin,
                 case_key=case_key,

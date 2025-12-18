@@ -1,4 +1,4 @@
-"""Tests for config validation error messages (Milestone 1)."""
+"""Tests for config validation error messages"""
 
 import pytest
 
