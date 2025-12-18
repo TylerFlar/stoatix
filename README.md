@@ -49,22 +49,22 @@ By default, `stoatix run` generates `summary.csv` with per-case statistics.
 
 ### Outlier Filtering
 
-| Method | Description |
-|--------|-------------|
+| Method          | Description                                                                     |
+| --------------- | ------------------------------------------------------------------------------- |
 | `iqr` (default) | Per-case IQR filtering: values outside [Q1 - 1.5×IQR, Q3 + 1.5×IQR] are dropped |
-| `none` | Keep all successful elapsed times |
+| `none`          | Keep all successful elapsed times                                               |
 
 Use `--outliers none` or `--outliers iqr` to control this behavior.
 
 ### Statistics Definitions
 
-| Statistic | Definition |
-|-----------|------------|
-| `median_s` | Median of filtered elapsed times |
-| `mean_s` | Arithmetic mean of filtered elapsed times |
-| `stdev_s` | Sample standard deviation (ddof=1); blank if n < 2 |
-| `p95_s` | 95th percentile using linear interpolation between adjacent sorted values |
-| `min_s`, `max_s` | Min/max of filtered elapsed times |
+| Statistic        | Definition                                                                |
+| ---------------- | ------------------------------------------------------------------------- |
+| `median_s`       | Median of filtered elapsed times                                          |
+| `mean_s`         | Arithmetic mean of filtered elapsed times                                 |
+| `stdev_s`        | Sample standard deviation (ddof=1); blank if n < 2                        |
+| `p95_s`          | 95th percentile using linear interpolation between adjacent sorted values |
+| `min_s`, `max_s` | Min/max of filtered elapsed times                                         |
 
 ### Standalone Summarization
 
@@ -167,6 +167,20 @@ uv run stoatix profile <config.yaml|cases.json> [OPTIONS]
 #   --flamegraph-dir PATH  Directory containing FlameGraph scripts
 #   --strict/--no-strict   Fail on errors vs degrade gracefully (default: strict)
 
+# CI regression gate (for CI pipelines)
+uv run stoatix ci-gate <baseline.jsonl> <pr.jsonl> [OPTIONS]
+
+# CI gate command options:
+#   --threshold FLOAT                     Classification threshold (default: 0.05)
+#   --outliers TEXT                       iqr | none (default: iqr)
+#   --metric TEXT                         median_s | mean_s | p95_s (default: median_s)
+#   --json-out PATH                       Output JSON path (default: compare.json next to pr)
+#   --md-out PATH                         Output markdown path (default: compare.md next to pr)
+#   --fail-on-regression/--no-fail-on-regression     Exit 1 on regressions (default: true)
+#   --fail-on-needs-attention/--no-fail-on-needs-attention  Exit 2 on noisy cases (default: false)
+#   --top INTEGER                         Max rows in markdown (default: 50)
+#   --sort TEXT                           stable | priority (default: priority)
+
 # Examples:
 uv run stoatix run config.yaml --out results/
 uv run stoatix run config.yaml --shuffle --seed 42
@@ -176,6 +190,7 @@ uv run stoatix summarize out/results.jsonl --out report.csv
 uv run stoatix compare main/results.jsonl pr/results.jsonl --threshold 0.03
 uv run stoatix profile config.yaml --case-id abc123 --out profiles/
 uv run stoatix profile out/cases.json --from-compare out/compare.json --top 3
+uv run stoatix ci-gate main/results.jsonl pr/results.jsonl --threshold 0.03
 ```
 
 ## Linux perf stat Integration
@@ -219,13 +234,13 @@ Percent change is computed as:
 pct_change = (pr_metric - main_metric) / main_metric
 ```
 
-| Classification | Condition |
-|----------------|-----------|
-| **regressed** | `pct_change > threshold` |
-| **improved** | `pct_change < -threshold` |
-| **unchanged** | within ±threshold |
-| **added** | case exists only in PR |
-| **removed** | case exists only in main |
+| Classification | Condition                 |
+| -------------- | ------------------------- |
+| **regressed**  | `pct_change > threshold`  |
+| **improved**   | `pct_change < -threshold` |
+| **unchanged**  | within ±threshold         |
+| **added**      | case exists only in PR    |
+| **removed**    | case exists only in main  |
 
 Default threshold is 5% (`--threshold 0.05`). Default metric is `median_s`.
 
@@ -247,6 +262,64 @@ Output is fully deterministic for reproducible CI:
 - **Priority sort** (`--sort priority`, default): regressed cases first, then stable order within each classification
 
 Upstream run ordering can be randomized with `stoatix run --shuffle --seed <N>` to reduce measurement bias, but comparison results remain deterministic regardless of execution order.
+
+## CI Regression Gate
+
+The `ci-gate` command is designed for CI pipelines. It compares results, writes artifacts, and exits with appropriate codes.
+
+### Usage
+
+```bash
+# Basic CI gate (fails on any regression)
+uv run stoatix ci-gate main/results.jsonl pr/results.jsonl
+
+# Custom threshold
+uv run stoatix ci-gate main/results.jsonl pr/results.jsonl --threshold 0.03
+
+# Also fail on noisy/unreliable results
+uv run stoatix ci-gate main/results.jsonl pr/results.jsonl --fail-on-needs-attention
+
+# Don't fail on regressions (just report)
+uv run stoatix ci-gate main/results.jsonl pr/results.jsonl --no-fail-on-regression
+```
+
+### Outputs
+
+- **`compare.json`** — Structured comparison data with git info from both runs
+- **`compare.md`** — Markdown report (also printed to stdout for PR comments)
+
+### Exit Codes
+
+| Code | Condition                                                        |
+| ---- | ---------------------------------------------------------------- |
+| 0    | No regressions (or `--no-fail-on-regression`)                    |
+| 1    | Regressions detected (with `--fail-on-regression`, the default)  |
+| 2    | Cases need attention (with `--fail-on-needs-attention`, no regressions) |
+
+### Git Info
+
+If `session.json` exists next to each `results.jsonl`, the comparison metadata includes:
+
+- `baseline_git`: commit, branch, dirty status from baseline run
+- `pr_git`: commit, branch, dirty status from PR run
+
+This provides full audit trail linking comparison results to exact code versions.
+
+### CI Configuration
+
+The repository includes `ci/stoatix.ci.yml` — a curated benchmark subset for CI pipelines:
+
+- **Fast**: ~12 cases with conservative run counts (warmups=1, runs=5)
+- **Stable**: Deterministic workloads (no external dependencies)
+- **Representative**: CPU, memory, string, dict, and I/O operations
+
+```bash
+# Run CI benchmarks
+uv run stoatix run ci/stoatix.ci.yml --out out/
+
+# Compare against baseline and gate
+uv run stoatix ci-gate baseline/results.jsonl pr/results.jsonl
+```
 
 ## Deep Profiling
 
@@ -276,13 +349,13 @@ uv run stoatix profile stoatix.yml --bench "sort" --case-key-contains "n=1000"
 
 Profiles are written to `out/profiles/<case_id>/`:
 
-| File | Description |
-|------|-------------|
-| `perf.data` | Raw perf record data |
-| `perf.script` | Decoded stack traces |
-| `folded.txt` | Collapsed stacks for flamegraph |
-| `flamegraph.svg` | Interactive flamegraph (if tools available) |
-| `meta.json` | Audit link: case definition, perf version, timestamps |
+| File             | Description                                           |
+| ---------------- | ----------------------------------------------------- |
+| `perf.data`      | Raw perf record data                                  |
+| `perf.script`    | Decoded stack traces                                  |
+| `folded.txt`     | Collapsed stacks for flamegraph                       |
+| `flamegraph.svg` | Interactive flamegraph (if tools available)           |
+| `meta.json`      | Audit link: case definition, perf version, timestamps |
 
 ### Options
 
@@ -306,4 +379,4 @@ When `out/profiles/` exists, `stoatix report` automatically:
 
 ## License
 
-MIT
+[MIT](LICENSE)

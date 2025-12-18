@@ -1223,6 +1223,275 @@ def compare(
         raise typer.Exit(code=1)
 
 
+@app.command("ci-gate")
+def ci_gate(
+    baseline_jsonl: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to baseline results.jsonl (e.g., main branch).",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    pr_jsonl: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to PR results.jsonl (e.g., feature branch).",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    threshold: Annotated[
+        float,
+        typer.Option(
+            "--threshold",
+            help="Percentage threshold for classifying regressions/improvements.",
+        ),
+    ] = 0.05,
+    outliers: Annotated[
+        str,
+        typer.Option(
+            "--outliers",
+            help="Outlier filtering method: 'iqr' or 'none'.",
+        ),
+    ] = "iqr",
+    metric: Annotated[
+        str,
+        typer.Option(
+            "--metric",
+            help="Metric to compare: 'median_s', 'mean_s', or 'p95_s'.",
+        ),
+    ] = "median_s",
+    json_out: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--json-out",
+            help="Output path for compare.json. Defaults to sibling of pr_jsonl.",
+        ),
+    ] = None,
+    md_out: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--md-out",
+            help="Output path for compare.md. Defaults to sibling of pr_jsonl.",
+        ),
+    ] = None,
+    fail_on_regression: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-regression/--no-fail-on-regression",
+            help="Exit code 1 if any regressions detected.",
+        ),
+    ] = True,
+    fail_on_needs_attention: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-needs-attention/--no-fail-on-needs-attention",
+            help="Exit code 2 if any cases need attention (noisy/low samples).",
+        ),
+    ] = False,
+    top: Annotated[
+        int,
+        typer.Option(
+            "--top",
+            help="Limit table rows in markdown output. 0 for unlimited.",
+        ),
+    ] = 50,
+    sort: Annotated[
+        str,
+        typer.Option(
+            "--sort",
+            help="Sort mode: 'stable' (by name) or 'priority' (regressed first).",
+        ),
+    ] = "priority",
+    noise_cv: Annotated[
+        float,
+        typer.Option(
+            "--noise-cv",
+            help="CV threshold for flagging noisy cases.",
+        ),
+    ] = 0.05,
+    noise_p95_ratio: Annotated[
+        float,
+        typer.Option(
+            "--noise-p95-ratio",
+            help="P95/median ratio threshold for flagging noisy cases.",
+        ),
+    ] = 1.10,
+    min_ok: Annotated[
+        int,
+        typer.Option(
+            "--min-ok",
+            help="Minimum OK iterations required.",
+        ),
+    ] = 3,
+) -> None:
+    """CI regression gate: compare results and fail on regressions.
+
+    Compares baseline (e.g., main branch) against PR results, writes
+    compare.json and compare.md, prints markdown to stdout, and exits
+    with appropriate code for CI integration.
+
+    Exit codes:
+      0 - No regressions (or --no-fail-on-regression)
+      1 - Regressions detected (with --fail-on-regression)
+      2 - Cases need attention (with --fail-on-needs-attention, no regressions)
+    """
+    from stoatix.compare import (
+        compare_runs,
+        render_compare_markdown,
+        write_compare_json,
+        write_compare_md,
+    )
+
+    # Validate outliers option
+    if outliers not in ("iqr", "none"):
+        typer.echo(
+            f"Error: Invalid --outliers value '{outliers}'. Must be 'iqr' or 'none'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate metric option
+    valid_metrics = ("median_s", "mean_s", "p95_s")
+    if metric not in valid_metrics:
+        typer.echo(
+            f"Error: Invalid --metric value '{metric}'. Must be one of: {', '.join(valid_metrics)}.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate sort option
+    if sort not in ("stable", "priority"):
+        typer.echo(
+            f"Error: Invalid --sort value '{sort}'. Must be 'stable' or 'priority'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate threshold
+    if threshold < 0:
+        typer.echo("Error: --threshold must be non-negative.", err=True)
+        raise typer.Exit(code=1)
+
+    # Validate noise_cv
+    if noise_cv < 0:
+        typer.echo("Error: --noise-cv must be non-negative.", err=True)
+        raise typer.Exit(code=1)
+
+    # Validate noise_p95_ratio
+    if noise_p95_ratio < 1.0:
+        typer.echo("Error: --noise-p95-ratio must be >= 1.0.", err=True)
+        raise typer.Exit(code=1)
+
+    # Validate min_ok
+    if min_ok < 1:
+        typer.echo("Error: --min-ok must be at least 1.", err=True)
+        raise typer.Exit(code=1)
+
+    # Determine default output paths
+    if json_out is None:
+        json_out = pr_jsonl.parent / "compare.json"
+    if md_out is None:
+        md_out = pr_jsonl.parent / "compare.md"
+
+    try:
+        # Load git info from sibling session.json files (best-effort)
+        baseline_git = _load_git_info_from_session(baseline_jsonl.parent)
+        pr_git = _load_git_info_from_session(pr_jsonl.parent)
+
+        # Run comparison
+        compare_result = compare_runs(
+            main_results=baseline_jsonl,
+            pr_results=pr_jsonl,
+            threshold=threshold,
+            outliers=outliers,  # type: ignore[arg-type]
+            metric=metric,
+            noise_cv_threshold=noise_cv,
+            noise_p95_ratio_threshold=noise_p95_ratio,
+            min_ok=min_ok,
+        )
+
+        # Add git info to metadata
+        compare_result["metadata"]["baseline_git"] = baseline_git
+        compare_result["metadata"]["pr_git"] = pr_git
+
+        # Render markdown
+        md_content = render_compare_markdown(
+            compare_result,
+            top_n=top,
+            sort_mode=sort,  # type: ignore[arg-type]
+        )
+
+        # Print markdown to stdout (comment-ready)
+        typer.echo(md_content)
+
+        # Write JSON
+        write_compare_json(json_out, compare_result)
+        typer.echo(f"JSON written to: {json_out}", err=True)
+
+        # Write markdown
+        write_compare_md(md_out, md_content)
+        typer.echo(f"Markdown written to: {md_out}", err=True)
+
+        # Determine exit code
+        counts = compare_result["counts"]
+
+        if fail_on_regression and counts["regressed"] > 0:
+            typer.echo(
+                f"\n❌ CI gate FAILED: {counts['regressed']} regression(s) detected.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        if fail_on_needs_attention and counts["needs_attention"] > 0:
+            typer.echo(
+                f"\n⚠️  CI gate FAILED: {counts['needs_attention']} case(s) need attention.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+
+        # Success
+        typer.echo("\n✅ CI gate PASSED: No regressions detected.", err=True)
+
+    except FileNotFoundError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+    except json.JSONDecodeError as e:
+        typer.echo(
+            f"Error: Failed to parse results file: {e.msg} at line {e.lineno}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+
+
+def _load_git_info_from_session(out_dir: Path) -> dict[str, Any] | None:
+    """Load git_info from session.json in the given directory.
+
+    Args:
+        out_dir: Directory containing session.json.
+
+    Returns:
+        git_info dict if found, None otherwise.
+    """
+    session_path = out_dir / "session.json"
+    if not session_path.exists():
+        return None
+
+    try:
+        with session_path.open(encoding="utf-8") as f:
+            session_data = json.load(f)
+        return session_data.get("git_info")
+    except (json.JSONDecodeError, OSError, KeyError):
+        return None
+
+
 def _markdown_to_html(md_content: str) -> str:
     """Convert markdown content to a simple standalone HTML document.
 

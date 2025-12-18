@@ -1,0 +1,59 @@
+# Stoatix Baseline Benchmark Workflow
+#
+# Generates baseline benchmark results on main branch for PR comparison.
+# Artifacts are used by stoatix-pr.yml for regression detection.
+
+name: Stoatix Baseline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    name: Generate Baseline Benchmarks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Run baseline benchmarks
+        run: |
+          uv run stoatix run ci/stoatix.ci.yml \
+            --out baseline_out/ \
+            --no-report \
+            --no-plots
+
+      - name: Prune uv cache
+        run: uv cache prune --ci
+
+      - name: Upload baseline artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stoatix-baseline
+          retention-days: 30
+          path: |
+            baseline_out/results.jsonl
+            baseline_out/session.json
+            baseline_out/cases.json
+            baseline_out/summary.csv
+            baseline_out/config.resolved.yml

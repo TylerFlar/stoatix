@@ -1,0 +1,127 @@
+# Stoatix PR Gate Workflow
+#
+# Runs benchmarks on PRs and compares against baseline from main.
+# Posts results as a PR comment and blocks merge on regressions.
+
+name: Stoatix PR Gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: stoatix-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Performance Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Download baseline artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x .github/scripts/download-baseline.sh
+          .github/scripts/download-baseline.sh
+          unzip -o baseline.zip -d baseline_out/
+
+      - name: Run PR benchmarks
+        run: |
+          uv run stoatix run ci/stoatix.ci.yml \
+            --out pr_out/ \
+            --no-plots
+
+      - name: Compare and gate
+        id: gate
+        continue-on-error: true
+        run: |
+          uv run stoatix ci-gate \
+            baseline_out/results.jsonl \
+            pr_out/results.jsonl \
+            --threshold 0.05 \
+            --md-out pr_out/compare.md \
+            --json-out pr_out/compare.json
+
+      - name: Post PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '### Stoatix performance gate';
+            
+            // Read the comparison markdown
+            let body;
+            try {
+              body = fs.readFileSync('pr_out/compare.md', 'utf8');
+            } catch (e) {
+              body = `${marker}\n\n⚠️ Could not read comparison results.\n`;
+            }
+            
+            // Ensure marker is at the top
+            if (!body.startsWith(marker)) {
+              body = `${marker}\n\n${body}`;
+            }
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const existing = comments.find(c => c.body.startsWith(marker));
+            
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
+
+      - name: Upload PR artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stoatix-pr-run
+          retention-days: 14
+          path: |
+            pr_out/**
+            baseline_out/session.json
+
+      - name: Fail on regression
+        if: steps.gate.outcome == 'failure'
+        run: |
+          echo "::error::Performance regression detected. See PR comment for details."
+          exit 1

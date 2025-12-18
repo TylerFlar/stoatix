@@ -1,0 +1,51 @@
+# Stoatix CI Benchmark Suite
+# 
+# A curated subset of benchmarks for CI regression detection.
+# Designed to be fast, deterministic, and stable.
+#
+# Usage:
+#   uv run stoatix run ci/stoatix.ci.yml --out out/
+#   uv run stoatix ci-gate main/results.jsonl pr/results.jsonl
+
+defaults:
+  warmups: 1
+  runs: 5
+  retries: 0
+  timeout_s: 30.0
+
+benchmarks:
+  # CPU-bound: sorting algorithm performance
+  - name: sort-integers
+    command: ["python", "-c", "import random; data = list(range({n})); random.seed(42); random.shuffle(data); sorted(data)"]
+    matrix:
+      n: [10000, 50000]
+
+  # Memory allocation: list comprehension
+  - name: list-comprehension
+    command: ["python", "-c", "x = [i * 2 for i in range({n})]"]
+    matrix:
+      n: [100000, 500000]
+
+  # String operations: join and split
+  - name: string-ops
+    command: ["python", "-c", "s = ','.join(str(i) for i in range({n})); s.split(',')"]
+    matrix:
+      n: [10000, 50000]
+
+  # Math-heavy: sum of squares
+  - name: math-sum-squares
+    command: ["python", "-c", "sum(i*i for i in range({n}))"]
+    matrix:
+      n: [100000, 500000]
+
+  # Dictionary operations
+  - name: dict-ops
+    command: ["python", "-c", "d = {{i: i*2 for i in range({n})}}; [d.get(i) for i in range({n})]"]
+    matrix:
+      n: [10000, 50000]
+
+  # I/O simulation: json encode/decode
+  - name: json-roundtrip
+    command: ["python", "-c", "import json; data = {{'items': list(range({n}))}}; json.loads(json.dumps(data))"]
+    matrix:
+      n: [1000, 5000]
