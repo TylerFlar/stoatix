@@ -42,7 +42,8 @@ def test_validate_valid_config() -> None:
         f.flush()
         result = runner.invoke(app, ["validate", f.name])
         assert result.exit_code == 0
-        assert "valid" in result.stdout.lower()
+        assert "benchmarks:" in result.stdout.lower()
+        assert "total cases:" in result.stdout.lower()
 
 
 def test_validate_missing_config() -> None:

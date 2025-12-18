@@ -2,12 +2,14 @@
 
 import hashlib
 import logging
+import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Any, Literal
 
-from stoatix.config import BenchmarkConfig, SuiteConfig, load_config
+from stoatix.config import load_config
+from stoatix.plan import CaseSpec, expand_suite
 from stoatix.results import (
     generate_suite_id,
     new_run_record,
@@ -51,8 +53,11 @@ def run_suite(config_path: str | Path, out_dir: str | Path) -> None:
     }
     write_session_metadata(out_path, metadata)
 
-    # Run all benchmarks
-    _run_benchmarks(config, suite_id, out_path)
+    # Expand config to cases and run
+    cases = expand_suite(config)
+    logger.info("Expanded to %d case(s)", len(cases))
+
+    _run_cases(cases, suite_id, out_path)
 
     logger.info("Results saved to: %s", out_path)
 
@@ -72,58 +77,63 @@ def _compute_file_hash(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _run_benchmarks(config: SuiteConfig, suite_id: str, out_dir: Path) -> None:
-    """Run benchmarks based on the provided configuration.
+def _run_cases(cases: list[CaseSpec], suite_id: str, out_dir: Path) -> None:
+    """Run all expanded cases.
 
     Args:
-        config: SuiteConfig specifying benchmarks to run.
+        cases: List of CaseSpec objects to run.
         suite_id: Unique identifier for this suite run.
         out_dir: Output directory for results.
     """
     runs_file = out_dir / "runs.jsonl"
 
-    if not config.benchmarks:
-        logger.warning("No benchmarks specified in configuration.")
+    if not cases:
+        logger.warning("No cases to run.")
         return
 
-    for benchmark in config.benchmarks:
-        logger.info("Running benchmark: %s", benchmark.name)
+    for case in cases:
+        case_label = f"{case.bench_name}"
+        if case.case_key:
+            case_label += f" [{case.case_key}]"
+
+        logger.info("Running case: %s", case_label)
         logger.debug(
             "  command=%s, warmups=%d, runs=%d, timeout_s=%s",
-            benchmark.command,
-            benchmark.warmups,
-            benchmark.runs,
-            benchmark.timeout_s,
+            case.command,
+            case.warmups,
+            case.runs,
+            case.timeout_s,
         )
+        logger.debug("  case_id=%s", case.case_id)
 
         # Run warmups
-        for i in range(benchmark.warmups):
-            logger.debug("  Warmup %d/%d", i + 1, benchmark.warmups)
+        for i in range(case.warmups):
+            logger.debug("  Warmup %d/%d", i + 1, case.warmups)
             record = _execute_run(
                 suite_id=suite_id,
-                benchmark=benchmark,
+                case=case,
                 run_kind="warmup",
                 iteration=i,
             )
             write_jsonl(runs_file, [record])
 
         # Run measured iterations
-        for i in range(benchmark.runs):
-            logger.debug("  Run %d/%d", i + 1, benchmark.runs)
+        for i in range(case.runs):
+            logger.debug("  Run %d/%d", i + 1, case.runs)
             record = _execute_run(
                 suite_id=suite_id,
-                benchmark=benchmark,
+                case=case,
                 run_kind="measured",
                 iteration=i,
             )
             write_jsonl(runs_file, [record])
 
-        logger.info("Benchmark %s completed", benchmark.name)
+        logger.info("Case %s completed", case_label)
 
 
 def _execute_run(
     suite_id: str,
-    benchmark: BenchmarkConfig,
+    case: CaseSpec,
     run_kind: Literal["warmup", "measured"],
     iteration: int,
 ) -> dict[str, Any]:
@@ -131,7 +141,7 @@ def _execute_run(
 
     Args:
         suite_id: Unique identifier for this suite run.
-        benchmark: Benchmark configuration.
+        case: CaseSpec to execute.
         run_kind: Type of run - "warmup" or "measured".
         iteration: Iteration number (0-indexed).
 
@@ -143,13 +153,22 @@ def _execute_run(
     ok: bool = False
     error_msg: str | None = None
 
+    # Prepare environment (inherit current env + case-specific overrides)
+    env = os.environ.copy()
+    env.update(case.env)
+
+    # Prepare working directory
+    cwd = case.cwd
+
     try:
         start = time.perf_counter()
         result = subprocess.run(
-            benchmark.command,
+            case.command,
             capture_output=True,
             text=True,
-            timeout=benchmark.timeout_s,
+            timeout=case.timeout_s,
+            cwd=cwd,
+            env=env,
         )
         elapsed_s = time.perf_counter() - start
         exit_code = result.returncode
@@ -165,22 +184,22 @@ def _execute_run(
             )
 
     except subprocess.TimeoutExpired:
-        elapsed_s = benchmark.timeout_s or 0.0
+        elapsed_s = case.timeout_s or 0.0
         exit_code = -1
         ok = False
-        error_msg = f"Timeout after {benchmark.timeout_s}s"
+        error_msg = f"Timeout after {case.timeout_s}s"
         logger.warning(
             "  %s iteration %d timed out after %ss",
             run_kind,
             iteration,
-            benchmark.timeout_s,
+            case.timeout_s,
         )
 
     except FileNotFoundError:
         exit_code = -1
         ok = False
-        error_msg = f"Command not found: {benchmark.command[0]}"
-        logger.error("  Command not found: %s", benchmark.command[0])
+        error_msg = f"Command not found: {case.command[0]}"
+        logger.error("  Command not found: %s", case.command[0])
 
     except OSError as e:
         exit_code = -1
@@ -190,14 +209,21 @@ def _execute_run(
 
     record = new_run_record(
         suite_id=suite_id,
-        bench_name=benchmark.name,
-        command=benchmark.command,
+        bench_name=case.bench_name,
+        command=case.command,
         run_kind=run_kind,
         iteration=iteration,
         elapsed_s=elapsed_s,
         exit_code=exit_code,
         ok=ok,
     )
+
+    # Add case-specific fields
+    record["case_id"] = case.case_id
+    record["case_key"] = case.case_key
+    record["params"] = case.params
+    record["cwd"] = case.cwd
+    record["env_overrides"] = case.env
 
     if error_msg:
         record["error"] = error_msg

@@ -1,15 +1,25 @@
 # Stoatix Configuration Example
 # ==============================
-# Cross-platform benchmarks using Python (works on Windows, macOS, Linux)
+# Demonstrates Milestone 1 features: defaults, matrix expansion, templating
+
+# Defaults applied to all benchmarks
+defaults:
+  warmups: 2
+  runs: 3
+  timeout_s: 60.0
+  env:
+    STOATIX_DEMO: "1"
 
 benchmarks:
-  - name: python-noop
-    command: ["python", "-c", "pass"]
-    warmups: 2
-    runs: 5
+  # CPU loop benchmark with matrix over iteration count
+  - name: cpu-loop
+    command: ["python", "-c", "x = 0\nfor i in range({n}): x += i\nprint(x)"]
+    matrix:
+      n: [1000000, 2000000]
 
-  - name: python-sum
-    command: ["python", "-c", "print(sum(range(10000)))"]
-    warmups: 1
-    runs: 5
-    timeout_s: 10.0
+  # List sort benchmark with 2D matrix: size x repeats = 4 cases
+  - name: list-sort
+    command: ["python", "-c", "import random; data = list(range({size})); random.shuffle(data); [sorted(data.copy()) for _ in range({repeats})]; print('done')"]
+    matrix:
+      size: [10000, 50000]
+      repeats: [1, 2]

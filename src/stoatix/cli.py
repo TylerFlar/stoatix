@@ -64,23 +64,41 @@ def validate(
     config_path: Annotated[
         Path,
         typer.Argument(
-            help="Path to the configuration file to validate.",
+            help="Path to the configuration file (canonical: stoatix.yml).",
             exists=True,
             readable=True,
         ),
     ],
 ) -> None:
-    """Validate a configuration file."""
+    """Validate a configuration file and show expansion summary."""
     from stoatix.config import load_config
+    from stoatix.plan import expand_suite
 
     try:
-        load_config(config_path)
-        typer.echo(f"Configuration file is valid: {config_path}")
+        config = load_config(config_path)
+        cases = expand_suite(config)
+
+        # Count cases per benchmark
+        cases_per_bench: dict[str, int] = {}
+        for case in cases:
+            cases_per_bench[case.bench_name] = cases_per_bench.get(case.bench_name, 0) + 1
+
+        typer.echo(f"Configuration: {config_path}")
+        typer.echo(f"Benchmarks: {len(config.benchmarks)}")
+        typer.echo(f"Total cases: {len(cases)}")
+        typer.echo()
+        for bench in config.benchmarks:
+            count = cases_per_bench.get(bench.name, 0)
+            typer.echo(f"  {bench.name}: {count} case(s)")
+
     except FileNotFoundError as e:
         typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(code=1)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
     except Exception as e:
-        typer.echo(f"Error: Failed to load configuration: {e}", err=True)
+        typer.echo(f"Error: {e}", err=True)
         raise typer.Exit(code=1)
 
 
