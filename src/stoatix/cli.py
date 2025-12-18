@@ -543,6 +543,221 @@ def report(
         raise typer.Exit(code=1)
 
 
+@app.command()
+def compare(
+    main_jsonl: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to baseline results.jsonl (e.g., main branch).",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    pr_jsonl: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to comparison results.jsonl (e.g., PR branch).",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    threshold: Annotated[
+        float,
+        typer.Option(
+            "--threshold",
+            help="Percentage threshold for classifying regressions/improvements.",
+        ),
+    ] = 0.05,
+    outliers: Annotated[
+        str,
+        typer.Option(
+            "--outliers",
+            help="Outlier filtering method: 'iqr' or 'none'.",
+        ),
+    ] = "iqr",
+    metric: Annotated[
+        str,
+        typer.Option(
+            "--metric",
+            help="Metric to compare: 'median_s', 'mean_s', or 'p95_s'.",
+        ),
+    ] = "median_s",
+    json_out: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--json-out",
+            help="Output path for compare.json. Defaults to sibling of pr_jsonl.",
+        ),
+    ] = None,
+    md_out: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--md-out",
+            help="Output path for markdown report. If not set, only stdout.",
+        ),
+    ] = None,
+    sort: Annotated[
+        str,
+        typer.Option(
+            "--sort",
+            help="Sort mode: 'stable' (by name) or 'priority' (regressed first).",
+        ),
+    ] = "priority",
+    top: Annotated[
+        int,
+        typer.Option(
+            "--top",
+            help="Limit table rows in markdown output. 0 for unlimited.",
+        ),
+    ] = 50,
+    noise_cv: Annotated[
+        float,
+        typer.Option(
+            "--noise-cv",
+            help="CV threshold for flagging noisy cases.",
+        ),
+    ] = 0.05,
+    noise_p95_ratio: Annotated[
+        float,
+        typer.Option(
+            "--noise-p95-ratio",
+            help="P95/median ratio threshold for flagging noisy cases.",
+        ),
+    ] = 1.10,
+    min_ok: Annotated[
+        int,
+        typer.Option(
+            "--min-ok",
+            help="Minimum OK iterations required.",
+        ),
+    ] = 3,
+) -> None:
+    """Compare two benchmark result files for regression detection."""
+    from stoatix.compare import (
+        compare_runs,
+        render_compare_markdown,
+        write_compare_json,
+        write_compare_md,
+    )
+
+    # Validate outliers option
+    if outliers not in ("iqr", "none"):
+        typer.echo(
+            f"Error: Invalid --outliers value '{outliers}'. Must be 'iqr' or 'none'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate metric option
+    valid_metrics = ("median_s", "mean_s", "p95_s")
+    if metric not in valid_metrics:
+        typer.echo(
+            f"Error: Invalid --metric value '{metric}'. Must be one of: {', '.join(valid_metrics)}.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate sort option
+    if sort not in ("stable", "priority"):
+        typer.echo(
+            f"Error: Invalid --sort value '{sort}'. Must be 'stable' or 'priority'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate threshold
+    if threshold < 0:
+        typer.echo(
+            "Error: --threshold must be non-negative.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate noise_cv
+    if noise_cv < 0:
+        typer.echo(
+            "Error: --noise-cv must be non-negative.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate noise_p95_ratio
+    if noise_p95_ratio < 1.0:
+        typer.echo(
+            "Error: --noise-p95-ratio must be >= 1.0.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate min_ok
+    if min_ok < 1:
+        typer.echo(
+            "Error: --min-ok must be at least 1.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Determine default json_out path
+    if json_out is None:
+        json_out = pr_jsonl.parent / "compare.json"
+
+    try:
+        # Run comparison
+        compare_result = compare_runs(
+            main_results=main_jsonl,
+            pr_results=pr_jsonl,
+            threshold=threshold,
+            outliers=outliers,  # type: ignore[arg-type]
+            metric=metric,
+            noise_cv_threshold=noise_cv,
+            noise_p95_ratio_threshold=noise_p95_ratio,
+            min_ok=min_ok,
+        )
+
+        # Render markdown
+        md_content = render_compare_markdown(
+            compare_result,
+            top_n=top,
+            sort_mode=sort,  # type: ignore[arg-type]
+        )
+
+        # Print to stdout
+        typer.echo(md_content)
+
+        # Always write JSON
+        write_compare_json(json_out, compare_result)
+        typer.echo(f"JSON written to: {json_out}", err=True)
+
+        # Optionally write markdown
+        if md_out is not None:
+            write_compare_md(md_out, md_content)
+            typer.echo(f"Markdown written to: {md_out}", err=True)
+
+        # Exit with status based on regressions
+        counts = compare_result["counts"]
+        if counts["regressed"] > 0:
+            typer.echo(
+                f"\n⚠️  {counts['regressed']} regression(s) detected.",
+                err=True,
+            )
+
+    except FileNotFoundError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+    except json.JSONDecodeError as e:
+        typer.echo(
+            f"Error: Failed to parse results file: {e.msg} at line {e.lineno}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    except Exception as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+
+
 def _markdown_to_html(md_content: str) -> str:
     """Convert markdown content to a simple standalone HTML document.
 

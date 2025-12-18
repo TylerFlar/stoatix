@@ -135,13 +135,70 @@ uv run stoatix summarize <results.jsonl> [OPTIONS]
 #   --out, -o PATH       Output CSV path (default: summary.csv in same dir)
 #   --outliers TEXT      Outlier filtering: 'iqr' (default) or 'none'
 
+# Compare two result files (e.g., main vs PR)
+uv run stoatix compare <main.jsonl> <pr.jsonl> [OPTIONS]
+
+# Compare command options:
+#   --threshold FLOAT      Classification threshold (default: 0.05)
+#   --metric TEXT          median_s | mean_s | p95_s (default: median_s)
+#   --sort TEXT            stable | priority (default: priority)
+#   --top INTEGER          Max rows in markdown table (default: 50)
+#   --json-out PATH        Output JSON path (default: compare.json next to pr)
+#   --md-out PATH          Optional markdown output file
+
 # Examples:
 uv run stoatix run config.yaml --out results/
 uv run stoatix run config.yaml --shuffle --seed 42
 uv run stoatix run config.yaml --no-summarize
 uv run stoatix run config.yaml --outliers none
 uv run stoatix summarize out/results.jsonl --out report.csv
+uv run stoatix compare main/results.jsonl pr/results.jsonl --threshold 0.03
 ```
+
+## Comparing Results
+
+The `compare` command detects regressions between two benchmark runs (e.g., main branch vs PR).
+
+### Input
+
+Both arguments must be `results.jsonl` files from `stoatix run`. Cases are matched by `(bench_name, case_id)`.
+
+### Classification
+
+Percent change is computed as:
+
+```
+pct_change = (pr_metric - main_metric) / main_metric
+```
+
+| Classification | Condition |
+|----------------|-----------|
+| **regressed** | `pct_change > threshold` |
+| **improved** | `pct_change < -threshold` |
+| **unchanged** | within ±threshold |
+| **added** | case exists only in PR |
+| **removed** | case exists only in main |
+
+Default threshold is 5% (`--threshold 0.05`). Default metric is `median_s`.
+
+### Needs Attention
+
+Cases are flagged when results may be unreliable:
+
+- **High CV**: `stdev_s / median_s >= 0.05` (coefficient of variation)
+- **Long tail**: `p95_s / median_s >= 1.10`
+- **Low samples**: fewer than 3 OK iterations in either run
+
+Tune with `--noise-cv`, `--noise-p95-ratio`, `--min-ok`.
+
+### Determinism
+
+Output is fully deterministic for reproducible CI:
+
+- **Stable sort** (`--sort stable`): rows ordered by `(bench_name, case_key, case_id)`
+- **Priority sort** (`--sort priority`, default): regressed cases first, then stable order within each classification
+
+Upstream run ordering can be randomized with `stoatix run --shuffle --seed <N>` to reduce measurement bias, but comparison results remain deterministic regardless of execution order.
 
 ## License
 
