@@ -104,11 +104,17 @@ def generate_report(
     # Run metadata
     _add_metadata_section(lines, session_data)
 
-    # Results table
-    _add_results_table(lines, summaries)
+    # Detect available profiles
+    profiles_info = _detect_profiles(out_dir, summaries)
+
+    # Results table (with optional Profile column)
+    _add_results_table(lines, summaries, profiles_info)
 
     # Perf stat section (if data available)
     _add_perf_stat_section(lines, summaries, records)
+
+    # Profiles section (if any exist)
+    _add_profiles_section(lines, profiles_info)
 
     # Failures section
     _add_failures_section(lines, summaries)
@@ -154,6 +160,59 @@ def _load_yaml_safe(path: Path) -> dict[str, Any] | None:
     except (yaml.YAMLError, OSError):
         pass
     return None
+
+
+def _detect_profiles(
+    out_dir: Path,
+    summaries: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Detect available profile artifacts for each case.
+
+    Looks for profiles under out_dir/profiles/<case_id>/.
+
+    Args:
+        out_dir: Output directory containing profiles/ subdirectory.
+        summaries: List of case summaries to check for profiles.
+
+    Returns:
+        Dict mapping case_id to profile info:
+            {
+                "flamegraph_path": "profiles/<case_id>/flamegraph.svg",  # relative
+                "meta_path": "profiles/<case_id>/meta.json",  # relative, or None
+                "has_flamegraph": bool,
+                "has_meta": bool,
+            }
+    """
+    profiles_dir = out_dir / "profiles"
+    result: dict[str, dict[str, Any]] = {}
+
+    if not profiles_dir.exists():
+        return result
+
+    # Build set of case_ids from summaries
+    {s["case_id"] for s in summaries}
+
+    # Also check directories that exist in profiles/
+    for case_dir in profiles_dir.iterdir():
+        if not case_dir.is_dir():
+            continue
+
+        case_id = case_dir.name
+        flamegraph_path = case_dir / "flamegraph.svg"
+        meta_path = case_dir / "meta.json"
+
+        has_flamegraph = flamegraph_path.exists()
+        has_meta = meta_path.exists()
+
+        if has_flamegraph or has_meta:
+            result[case_id] = {
+                "flamegraph_path": f"profiles/{case_id}/flamegraph.svg" if has_flamegraph else None,
+                "meta_path": f"profiles/{case_id}/meta.json" if has_meta else None,
+                "has_flamegraph": has_flamegraph,
+                "has_meta": has_meta,
+            }
+
+    return result
 
 
 def _add_title_section(lines: list[str], session_data: dict[str, Any] | None) -> None:
@@ -298,7 +357,11 @@ def _humanize_bytes(n: int) -> str:
     return f"{n:.1f} PB"
 
 
-def _add_results_table(lines: list[str], summaries: list[dict[str, Any]]) -> None:
+def _add_results_table(
+    lines: list[str],
+    summaries: list[dict[str, Any]],
+    profiles_info: dict[str, dict[str, Any]] | None = None,
+) -> None:
     """Add main results table."""
     lines.append("## Results")
     lines.append("")
@@ -307,6 +370,9 @@ def _add_results_table(lines: list[str], summaries: list[dict[str, Any]]) -> Non
         lines.append("*No results to display*")
         lines.append("")
         return
+
+    # Check if any profiles exist to decide whether to add Profile column
+    has_profiles = profiles_info and len(profiles_info) > 0
 
     # Table header
     headers = [
@@ -321,6 +387,9 @@ def _add_results_table(lines: list[str], summaries: list[dict[str, Any]]) -> Non
         "max_s",
         "outliers_dropped",
     ]
+    if has_profiles:
+        headers.append("Profile")
+
     lines.append("| " + " | ".join(headers) + " |")
     lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
 
@@ -341,6 +410,16 @@ def _add_results_table(lines: list[str], summaries: list[dict[str, Any]]) -> Non
             _fmt_float(s["max_s"]),
             str(s["n_outliers_dropped"]),
         ]
+
+        if has_profiles:
+            case_id = s["case_id"]
+            profile = profiles_info.get(case_id) if profiles_info else None
+            if profile and profile.get("has_flamegraph"):
+                # Link to flamegraph
+                row.append(f"[🔥]({profile['flamegraph_path']})")
+            else:
+                row.append("-")
+
         lines.append("| " + " | ".join(row) + " |")
 
     lines.append("")
@@ -438,6 +517,59 @@ def _add_perf_stat_section(
         ]
         lines.append("| " + " | ".join(row) + " |")
 
+    lines.append("")
+
+
+def _add_profiles_section(
+    lines: list[str],
+    profiles_info: dict[str, dict[str, Any]],
+) -> None:
+    """Add profiles section listing available flamegraphs and metadata.
+
+    Only displayed if at least one profile exists.
+    """
+    if not profiles_info:
+        return
+
+    lines.append("## Profiles")
+    lines.append("")
+    lines.append(
+        "Deep profiling artifacts captured with `perf record`. "
+        "Click flamegraph links to view interactive SVG visualizations."
+    )
+    lines.append("")
+
+    # Table header
+    headers = ["case_id", "Flamegraph", "Metadata"]
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+
+    # Sort by case_id for stable output
+    for case_id in sorted(profiles_info.keys()):
+        profile = profiles_info[case_id]
+
+        # Flamegraph link
+        if profile.get("has_flamegraph"):
+            flamegraph_cell = f"[flamegraph.svg]({profile['flamegraph_path']})"
+        else:
+            flamegraph_cell = "-"
+
+        # Metadata link
+        if profile.get("has_meta"):
+            meta_cell = f"[meta.json]({profile['meta_path']})"
+        else:
+            meta_cell = "-"
+
+        row = [f"`{case_id}`", flamegraph_cell, meta_cell]
+        lines.append("| " + " | ".join(row) + " |")
+
+    lines.append("")
+
+    # Add note about profile directory
+    lines.append(
+        "> **Note:** Profile artifacts are in `profiles/<case_id>/` directories. "
+        "Each contains `perf.data`, `perf.script`, `folded.txt`, and optionally `flamegraph.svg`."
+    )
     lines.append("")
 
 

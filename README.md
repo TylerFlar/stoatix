@@ -152,6 +152,21 @@ uv run stoatix compare <main.jsonl> <pr.jsonl> [OPTIONS]
 #   --json-out PATH        Output JSON path (default: compare.json next to pr)
 #   --md-out PATH          Optional markdown output file
 
+# Profile cases with perf record (Linux only)
+uv run stoatix profile <config.yaml|cases.json> [OPTIONS]
+
+# Profile command options:
+#   --out, -o PATH         Output directory (default: out)
+#   --case-id TEXT         Case ID(s) to profile (repeatable)
+#   --bench TEXT           Filter by benchmark name substring
+#   --case-key-contains    Filter by case_key substring
+#   --from-compare PATH    Select top regressions from compare.json
+#   --top INTEGER          Number of regressions to profile (default: 5)
+#   --freq INTEGER         Sampling frequency in Hz (default: 99)
+#   --call-graph TEXT      fp | dwarf (default: dwarf)
+#   --flamegraph-dir PATH  Directory containing FlameGraph scripts
+#   --strict/--no-strict   Fail on errors vs degrade gracefully (default: strict)
+
 # Examples:
 uv run stoatix run config.yaml --out results/
 uv run stoatix run config.yaml --shuffle --seed 42
@@ -159,6 +174,8 @@ uv run stoatix run config.yaml --no-summarize
 uv run stoatix run config.yaml --outliers none
 uv run stoatix summarize out/results.jsonl --out report.csv
 uv run stoatix compare main/results.jsonl pr/results.jsonl --threshold 0.03
+uv run stoatix profile config.yaml --case-id abc123 --out profiles/
+uv run stoatix profile out/cases.json --from-compare out/compare.json --top 3
 ```
 
 ## Linux perf stat Integration
@@ -230,6 +247,62 @@ Output is fully deterministic for reproducible CI:
 - **Priority sort** (`--sort priority`, default): regressed cases first, then stable order within each classification
 
 Upstream run ordering can be randomized with `stoatix run --shuffle --seed <N>` to reduce measurement bias, but comparison results remain deterministic regardless of execution order.
+
+## Deep Profiling
+
+The `profile` command captures detailed CPU profiles with `perf record` and generates interactive flamegraphs.
+
+### Usage
+
+```bash
+# Profile specific cases from config
+uv run stoatix profile stoatix.yml --out out/ --case-id abc123 --case-id def456
+
+# Profile top 3 regressions from a compare result
+uv run stoatix profile out/cases.json --from-compare out/compare.json --top 3
+
+# Filter by benchmark name or case key
+uv run stoatix profile stoatix.yml --bench "sort" --case-key-contains "n=1000"
+```
+
+### Requirements
+
+- **Linux** with `perf` installed (`linux-tools-generic` on Ubuntu/Debian)
+- **FlameGraph tools** for SVG generation:
+  - `stackcollapse-perf.pl` and `flamegraph.pl` on PATH, OR
+  - `--flamegraph-dir /path/to/FlameGraph/` pointing to the [FlameGraph repo](https://github.com/brendangregg/FlameGraph)
+
+### Output
+
+Profiles are written to `out/profiles/<case_id>/`:
+
+| File | Description |
+|------|-------------|
+| `perf.data` | Raw perf record data |
+| `perf.script` | Decoded stack traces |
+| `folded.txt` | Collapsed stacks for flamegraph |
+| `flamegraph.svg` | Interactive flamegraph (if tools available) |
+| `meta.json` | Audit link: case definition, perf version, timestamps |
+
+### Options
+
+```bash
+# Perf sampling options
+--freq 99              # Sampling frequency in Hz (default: 99)
+--call-graph dwarf     # Call graph method: 'fp' or 'dwarf' (default: dwarf)
+
+# Strict mode (default)
+--strict               # Fail if perf missing or flamegraph generation fails
+
+# Non-strict mode
+--no-strict            # Capture what's possible, warn on failures
+```
+
+### Integration with Reports
+
+When `out/profiles/` exists, `stoatix report` automatically:
+- Adds a **Profile** column with 🔥 links in the results table
+- Includes a **Profiles** section listing all flamegraphs and metadata files
 
 ## License
 

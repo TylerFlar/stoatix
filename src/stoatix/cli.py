@@ -3,7 +3,7 @@
 import json
 import logging
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import typer
 
@@ -569,6 +569,442 @@ def report(
         raise typer.Exit(code=1)
     except Exception as e:
         typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def profile(
+    config_or_cases: Annotated[
+        Path,
+        typer.Argument(
+            help="Path to stoatix.yml config file or cases.json file.",
+            exists=True,
+            readable=True,
+        ),
+    ],
+    out: Annotated[
+        Path,
+        typer.Option(
+            "--out",
+            "-o",
+            help="Output directory for profile artifacts.",
+        ),
+    ] = Path("out"),
+    # Selection options
+    case_id: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--case-id",
+            help="Case ID(s) to profile (repeatable).",
+        ),
+    ] = None,
+    bench: Annotated[
+        Optional[str],
+        typer.Option(
+            "--bench",
+            help="Filter to benchmarks containing this substring (case-insensitive).",
+        ),
+    ] = None,
+    case_key_contains: Annotated[
+        Optional[str],
+        typer.Option(
+            "--case-key-contains",
+            help="Filter to cases where case_key contains this substring.",
+        ),
+    ] = None,
+    from_compare: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--from-compare",
+            help="Path to compare.json to select top regressions.",
+            exists=True,
+            readable=True,
+        ),
+    ] = None,
+    top: Annotated[
+        int,
+        typer.Option(
+            "--top",
+            help="Number of top regressions to profile (only with --from-compare).",
+        ),
+    ] = 0,
+    # Perf options
+    freq: Annotated[
+        int,
+        typer.Option(
+            "--freq",
+            help="Sampling frequency in Hz for perf record.",
+        ),
+    ] = 99,
+    call_graph: Annotated[
+        str,
+        typer.Option(
+            "--call-graph",
+            help="Call graph recording method: 'fp' or 'dwarf'.",
+        ),
+    ] = "dwarf",
+    flamegraph_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--flamegraph-dir",
+            help="Directory containing stackcollapse-perf.pl and flamegraph.pl.",
+        ),
+    ] = None,
+    strict: Annotated[
+        bool,
+        typer.Option(
+            "--strict/--no-strict",
+            help="Fail if perf is missing or flamegraph generation fails.",
+        ),
+    ] = True,
+) -> None:
+    """Profile selected benchmark cases with perf record and generate flamegraphs."""
+    import hashlib
+    import os
+    import subprocess
+    from datetime import datetime, timezone
+
+    from stoatix.config import load_config
+    from stoatix.plan import expand_suite
+    from stoatix.profile_select import (
+        filter_cases,
+        load_cases_json,
+        match_case_ids,
+        select_top_regressions,
+    )
+    from stoatix.profiling import (
+        check_profiling_support,
+        generate_flamegraph,
+        run_perf_record,
+    )
+    from stoatix.results import generate_suite_id
+
+    # Validate call_graph option
+    if call_graph not in ("fp", "dwarf"):
+        typer.echo(
+            f"Error: Invalid --call-graph value '{call_graph}'. Must be 'fp' or 'dwarf'.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # Validate freq
+    if freq < 1:
+        typer.echo("Error: --freq must be at least 1.", err=True)
+        raise typer.Exit(code=1)
+
+    # Check profiling support
+    support = check_profiling_support(flamegraph_dir)
+
+    if strict:
+        if not support["can_record"]:
+            typer.echo(
+                f"Error: Cannot capture profiling data. Issues: {support['issues']}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+    else:
+        if not support["can_record"]:
+            typer.echo(
+                f"Warning: Profiling not fully supported. Issues: {support['issues']}",
+                err=True,
+            )
+
+    # Get perf version (best effort)
+    perf_version: str | None = None
+    if support["perf_available"]:
+        try:
+            result = subprocess.run(
+                ["perf", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                perf_version = result.stdout.strip()
+        except Exception:
+            pass  # Best effort
+
+    # Generate suite_id for this profiling session
+    suite_id = generate_suite_id()
+
+    # Track source information
+    source_info: dict[str, Any] = {
+        "config_path": None,
+        "cases_json_path": None,
+        "config_hash": None,
+    }
+
+    # Load cases from config or cases.json
+    try:
+        input_name = config_or_cases.name.lower()
+        if input_name.endswith(".json"):
+            # Load from cases.json
+            cases_data = load_cases_json(config_or_cases)
+            # Convert dicts to CaseSpec-like objects for consistent handling
+            all_cases = cases_data
+            source_info["cases_json_path"] = str(config_or_cases.resolve())
+        else:
+            # Assume it's a config file - expand suite
+            config = load_config(config_or_cases)
+            expanded = expand_suite(config)
+            source_info["config_path"] = str(config_or_cases.resolve())
+            # Compute config hash
+            with open(config_or_cases, "rb") as f:
+                source_info["config_hash"] = hashlib.sha256(f.read()).hexdigest()
+            # Convert CaseSpec objects to dicts for uniform handling
+            all_cases = [
+                {
+                    "bench_name": c.bench_name,
+                    "params": c.params,
+                    "command": c.command,
+                    "cwd": c.cwd,
+                    "env": c.env,
+                    "warmups": c.warmups,
+                    "runs": c.runs,
+                    "retries": c.retries,
+                    "timeout_s": c.timeout_s,
+                    "pin": {"cores": c.pin.cores} if c.pin else {"cores": None},
+                    "case_key": c.case_key,
+                    "case_id": c.case_id,
+                }
+                for c in expanded
+            ]
+    except FileNotFoundError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+    except ValueError as e:
+        typer.echo(f"Error: {e}", err=True)
+        raise typer.Exit(code=1)
+
+    # Apply selection filters
+    selected_cases = all_cases
+
+    # Apply --from-compare first (selects case_ids)
+    if from_compare is not None:
+        try:
+            with open(from_compare, "r", encoding="utf-8") as f:
+                compare_data = json.load(f)
+
+            n_top = top if top > 0 else 5  # Default to 5 if --top not specified
+            regression_ids = select_top_regressions(compare_data, top=n_top)
+
+            if not regression_ids:
+                typer.echo("Warning: No regressions found in compare.json", err=True)
+            else:
+                try:
+                    selected_cases = match_case_ids(
+                        selected_cases, regression_ids, strict=True
+                    )
+                except KeyError as e:
+                    typer.echo(f"Warning: {e}", err=True)
+                    # Fall back to non-strict matching
+                    selected_cases = match_case_ids(
+                        selected_cases, regression_ids, strict=False
+                    )
+
+        except json.JSONDecodeError as e:
+            typer.echo(f"Error: Invalid compare.json: {e}", err=True)
+            raise typer.Exit(code=1)
+
+    # Apply manual filters (cumulative with AND logic)
+    if case_id:
+        # --case-id overrides --from-compare selection
+        try:
+            selected_cases = match_case_ids(selected_cases, case_id, strict=True)
+        except KeyError:
+            # Try filtering from all_cases if they weren't in selected_cases
+            try:
+                selected_cases = match_case_ids(all_cases, case_id, strict=True)
+            except KeyError as e:
+                typer.echo(f"Error: {e}", err=True)
+                raise typer.Exit(code=1)
+
+    if bench:
+        selected_cases = filter_cases(selected_cases, bench=bench)
+
+    if case_key_contains:
+        selected_cases = filter_cases(selected_cases, case_key_contains=case_key_contains)
+
+    if not selected_cases:
+        typer.echo("Error: No cases match the selection criteria.", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(f"Selected {len(selected_cases)} case(s) for profiling")
+
+    # Create output directory
+    profiles_dir = out / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+
+    # Track results
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []  # (case_id, error)
+
+    for case in selected_cases:
+        case_id_str = case["case_id"]
+        bench_name = case["bench_name"]
+        case_key = case["case_key"]
+        command = case["command"]
+        cwd = case.get("cwd")
+        env_overrides = case.get("env", {})
+        warmups = case.get("warmups", 0)
+        timeout_s = case.get("timeout_s")
+
+        typer.echo(f"\n[{bench_name}] {case_key}")
+        typer.echo(f"  Case ID: {case_id_str}")
+
+        case_out_dir = profiles_dir / case_id_str
+        case_out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Prepare environment
+        run_env = os.environ.copy()
+        run_env.update(env_overrides)
+
+        # Run warmups (without perf)
+        if warmups > 0:
+            typer.echo(f"  Running {warmups} warmup(s)...")
+            for w in range(warmups):
+                try:
+                    subprocess.run(
+                        command,
+                        cwd=cwd,
+                        env=run_env,
+                        capture_output=True,
+                        timeout=timeout_s,
+                    )
+                except subprocess.TimeoutExpired:
+                    typer.echo(f"    Warmup {w + 1} timed out", err=True)
+                except Exception as e:
+                    typer.echo(f"    Warmup {w + 1} failed: {e}", err=True)
+
+        # Run profiled execution
+        if not support["can_record"]:
+            error_msg = f"Cannot record: {support['issues']}"
+            typer.echo(f"  ✗ {error_msg}", err=True)
+            failed.append((case_id_str, error_msg))
+            continue
+
+        typer.echo("  Running profiled execution...")
+        perf_data_path = case_out_dir / "perf.data"
+
+        result, perf_meta = run_perf_record(
+            command,
+            cwd=cwd,
+            env=run_env,
+            timeout_s=timeout_s,
+            perf_data_path=perf_data_path,
+            freq=freq,
+            call_graph=call_graph,
+        )
+
+        if not perf_meta["ok"]:
+            error_msg = perf_meta.get("error", "Unknown error")
+            typer.echo(f"  ✗ perf record failed: {error_msg}", err=True)
+            if strict:
+                failed.append((case_id_str, error_msg))
+                continue
+            # In non-strict mode, continue to try flamegraph if we have data
+
+        typer.echo(f"  perf.data: {perf_data_path}")
+
+        # Generate flamegraph
+        fg_result: dict[str, Any] = {"flamegraph_ok": False}
+        if support["can_flamegraph"] and perf_data_path.exists():
+            typer.echo("  Generating flamegraph...")
+            fg_result = generate_flamegraph(
+                perf_data_path=perf_data_path,
+                out_dir=case_out_dir,
+                flamegraph_dir=flamegraph_dir,
+                title=f"{bench_name}: {case_key}",
+            )
+
+            if fg_result["flamegraph_ok"]:
+                typer.echo(f"  flamegraph.svg: {case_out_dir / 'flamegraph.svg'}")
+            else:
+                error_msg = fg_result.get("error", "Unknown error")
+                typer.echo(f"  ✗ Flamegraph generation failed: {error_msg}", err=True)
+                if strict:
+                    failed.append((case_id_str, f"Flamegraph: {error_msg}"))
+                    continue
+        elif not support["can_flamegraph"]:
+            typer.echo("  Skipping flamegraph (tools not available)", err=True)
+
+        # Write meta.json with comprehensive audit information
+        meta = {
+            "created_at_utc": datetime.now(timezone.utc).isoformat(),
+            "suite_id": suite_id,
+            "source": source_info,
+            "case": {
+                "bench_name": bench_name,
+                "case_id": case_id_str,
+                "case_key": case_key,
+                "params": case.get("params", {}),
+                "command": command,
+                "cwd": cwd,
+                "env_overrides": env_overrides,
+                "warmups": warmups,
+                "runs": case.get("runs", 1),
+                "timeout_s": timeout_s,
+                "retries": case.get("retries", 0),
+                "pin": case.get("pin"),
+            },
+            "perf": {
+                "perf_version": perf_version,
+                "freq": freq,
+                "call_graph": call_graph,
+            },
+            "execution": {
+                "ok": perf_meta["ok"],
+                "elapsed_s": perf_meta["elapsed_s"],
+                "exit_code": perf_meta["exit_code"],
+                "timed_out": perf_meta["timed_out"],
+                "error": perf_meta.get("error"),
+            },
+            "flamegraph": {
+                "ok": fg_result.get("flamegraph_ok", False),
+                "steps_completed": fg_result.get("steps_completed", []),
+                "error": fg_result.get("error"),
+            },
+            "outputs": {
+                "perf_data_path": "perf.data" if perf_data_path.exists() else None,
+                "perf_script_path": fg_result.get("perf_script_path"),
+                "folded_path": fg_result.get("folded_path"),
+                "flamegraph_path": fg_result.get("flamegraph_path"),
+            },
+        }
+
+        meta_path = case_out_dir / "meta.json"
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+        # Track success (based on perf record success)
+        if perf_meta["ok"]:
+            succeeded.append(case_id_str)
+        elif not strict:
+            # In non-strict, partial success is still tracked
+            if perf_data_path.exists():
+                succeeded.append(case_id_str)
+            else:
+                failed.append((case_id_str, perf_meta.get("error", "Unknown")))
+
+    # Print summary
+    typer.echo("\n" + "=" * 60)
+    typer.echo("Profile Summary")
+    typer.echo("=" * 60)
+    typer.echo(f"Succeeded: {len(succeeded)}")
+    typer.echo(f"Failed: {len(failed)}")
+
+    if succeeded:
+        typer.echo(f"\nProfiles written to: {profiles_dir}")
+        for cid in succeeded:
+            typer.echo(f"  - {cid}/")
+
+    if failed:
+        typer.echo("\nFailed cases:")
+        for cid, err in failed:
+            typer.echo(f"  - {cid}: {err}")
+
+    # Exit with error if any failed in strict mode
+    if failed and strict:
         raise typer.Exit(code=1)
 
 
