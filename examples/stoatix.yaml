@@ -1,0 +1,15 @@
+# Stoatix Configuration Example
+# ==============================
+# Cross-platform benchmarks using Python (works on Windows, macOS, Linux)
+
+benchmarks:
+  - name: python-noop
+    command: ["python", "-c", "pass"]
+    warmups: 2
+    runs: 5
+
+  - name: python-sum
+    command: ["python", "-c", "print(sum(range(10000)))"]
+    warmups: 1
+    runs: 5
+    timeout_s: 10.0
